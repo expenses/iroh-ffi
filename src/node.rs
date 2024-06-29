@@ -221,12 +221,29 @@ impl Default for NodeOptions {
     }
 }
 
+#[uniffi::export(async_runtime = "tokio")]
+pub async fn start_iroh_node(path: String) -> IrohNode {
+    let path = PathBuf::from(path);
+    let options = NodeOptions::default();
+    let node = IrohNode::new_inner(path, options, None).await.unwrap();
+    node
+}
+
 /// An Iroh node. Allows you to sync, store, and transfer data.
+#[derive(uniffi::Object)]
 pub struct IrohNode {
     pub(crate) node: FsNode,
     pub(crate) sync_client: MemIroh,
     #[allow(dead_code)]
     pub(crate) tokio_rt: Option<tokio::runtime::Runtime>,
+}
+
+#[uniffi::export]
+impl IrohNode {
+    /// The string representation of the PublicKey of this node.
+    pub fn node_id(&self) -> String {
+        self.node.node_id().to_string()
+    }
 }
 
 impl IrohNode {
@@ -276,11 +293,6 @@ impl IrohNode {
             sync_client,
             tokio_rt,
         })
-    }
-
-    /// The string representation of the PublicKey of this node.
-    pub fn node_id(&self) -> String {
-        self.node.node_id().to_string()
     }
 
     /// Get statistics of the running node.
