@@ -33,10 +33,10 @@ enum LogLevel {
 interface IrohNode {
   /// Create a new iroh node. The `path` param should be a directory where we can store or load
   /// iroh data from a previous session.
-  [Throws=IrohError]
+  [Async,Throws=IrohError]
   constructor(string path);
   /// Create a new iroh node with options.
-  [Name=with_options,Throws=IrohError]
+  [Async,Name=with_options,Throws=IrohError]
   constructor(string path, NodeOptions opts);
   /// The string representation of the PublicKey of this node.
   string node_id();

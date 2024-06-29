@@ -239,26 +239,21 @@ impl IrohNode {
 
     /// Create a new iroh node. The `path` param should be a directory where we can store or load
     /// iroh data from a previous session.
-    pub fn new(path: String) -> Result<Self, IrohError> {
+    pub async fn new(path: String) -> Result<Self, IrohError> {
         let options = NodeOptions::default();
-        Self::with_options(path, options)
+        Self::with_options(path, options).await
     }
 
     /// Create a new iroh node with options.
-    pub fn with_options(path: String, options: NodeOptions) -> Result<Self, IrohError> {
+    pub async fn with_options(path: String, options: NodeOptions) -> Result<Self, IrohError> {
         let tokio_rt = tokio::runtime::Builder::new_multi_thread()
             .thread_name("main-runtime")
             .worker_threads(2)
             .enable_all()
             .build()
             .map_err(anyhow::Error::from)?;
-        let rt = tokio_rt.handle().clone();
-
         let path = PathBuf::from(path);
-        let node = block_on(&rt, async move {
-            Self::new_inner(path, options, Some(tokio_rt)).await
-        })?;
-
+        let node = Self::new_inner(path, options, Some(tokio_rt)).await?;
         Ok(node)
     }
 

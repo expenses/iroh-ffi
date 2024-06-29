@@ -17,19 +17,27 @@ package iroh
 // compile the Rust component. The easiest way to ensure this is to bundle the Kotlin
 // helpers directly inline like we're doing here.
 
-import com.sun.jna.Callback
 import com.sun.jna.Library
+import com.sun.jna.IntegerType
 import com.sun.jna.Native
 import com.sun.jna.Pointer
 import com.sun.jna.Structure
+import com.sun.jna.Callback
 import com.sun.jna.ptr.*
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.CharBuffer
 import java.nio.charset.CodingErrorAction
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
-import java.util.concurrent.atomic.AtomicLong
+import kotlin.coroutines.resume
+import kotlinx.coroutines.CancellableContinuation
+import kotlinx.coroutines.DelicateCoroutinesApi
+import kotlinx.coroutines.GlobalScope
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
 
 // This is a helper for safely working with byte buffers returned from the Rust code.
 // A rust-owned buffer is represented by its capacity, its current length, and a
@@ -40,41 +48,29 @@ open class RustBuffer : Structure() {
     // Note: `capacity` and `len` are actually `ULong` values, but JVM only supports signed values.
     // When dealing with these fields, make sure to call `toULong()`.
     @JvmField var capacity: Long = 0
-
     @JvmField var len: Long = 0
-
     @JvmField var data: Pointer? = null
 
-    class ByValue :
-        RustBuffer(),
-        Structure.ByValue
+    class ByValue: RustBuffer(), Structure.ByValue
+    class ByReference: RustBuffer(), Structure.ByReference
 
-    class ByReference :
-        RustBuffer(),
-        Structure.ByReference
-
-    internal fun setValue(other: RustBuffer) {
+   internal fun setValue(other: RustBuffer) {
         capacity = other.capacity
         len = other.len
         data = other.data
     }
 
     companion object {
-        internal fun alloc(size: ULong = 0UL) =
-            uniffiRustCall { status ->
-                // Note: need to convert the size to a `Long` value to make this work with JVM.
-                UniffiLib.INSTANCE.ffi_iroh_rustbuffer_alloc(size.toLong(), status)
-            }.also {
-                if (it.data == null) {
-                    throw RuntimeException("RustBuffer.alloc() returned null data pointer (size=$size)")
-                }
-            }
+        internal fun alloc(size: ULong = 0UL) = uniffiRustCall() { status ->
+            // Note: need to convert the size to a `Long` value to make this work with JVM.
+            UniffiLib.INSTANCE.ffi_iroh_rustbuffer_alloc(size.toLong(), status)
+        }.also {
+            if(it.data == null) {
+               throw RuntimeException("RustBuffer.alloc() returned null data pointer (size=${size})")
+           }
+        }
 
-        internal fun create(
-            capacity: ULong,
-            len: ULong,
-            data: Pointer?,
-        ): RustBuffer.ByValue {
+        internal fun create(capacity: ULong, len: ULong, data: Pointer?): RustBuffer.ByValue {
             var buf = RustBuffer.ByValue()
             buf.capacity = capacity.toLong()
             buf.len = len.toLong()
@@ -82,10 +78,9 @@ open class RustBuffer : Structure() {
             return buf
         }
 
-        internal fun free(buf: RustBuffer.ByValue) =
-            uniffiRustCall { status ->
-                UniffiLib.INSTANCE.ffi_iroh_rustbuffer_free(buf, status)
-            }
+        internal fun free(buf: RustBuffer.ByValue) = uniffiRustCall() { status ->
+            UniffiLib.INSTANCE.ffi_iroh_rustbuffer_free(buf, status)
+        }
     }
 
     @Suppress("TooGenericExceptionThrown")
@@ -136,14 +131,10 @@ class RustBufferByReference : ByReference(16) {
 @Structure.FieldOrder("len", "data")
 open class ForeignBytes : Structure() {
     @JvmField var len: Int = 0
-
     @JvmField var data: Pointer? = null
 
-    class ByValue :
-        ForeignBytes(),
-        Structure.ByValue
+    class ByValue : ForeignBytes(), Structure.ByValue
 }
-
 // The FfiConverter interface handles converter types to and from the FFI
 //
 // All implementing objects should be public to support external types.  When a
@@ -169,10 +160,7 @@ public interface FfiConverter<KotlinType, FfiType> {
     fun allocationSize(value: KotlinType): ULong
 
     // Write a Kotlin type to a `ByteBuffer`
-    fun write(
-        value: KotlinType,
-        buf: ByteBuffer,
-    )
+    fun write(value: KotlinType, buf: ByteBuffer)
 
     // Lower a value into a `RustBuffer`
     //
@@ -183,10 +171,9 @@ public interface FfiConverter<KotlinType, FfiType> {
     fun lowerIntoRustBuffer(value: KotlinType): RustBuffer.ByValue {
         val rbuf = RustBuffer.alloc(allocationSize(value))
         try {
-            val bbuf =
-                rbuf.data!!.getByteBuffer(0, rbuf.capacity).also {
-                    it.order(ByteOrder.BIG_ENDIAN)
-                }
+            val bbuf = rbuf.data!!.getByteBuffer(0, rbuf.capacity).also {
+                it.order(ByteOrder.BIG_ENDIAN)
+            }
             write(value, bbuf)
             rbuf.writeField("len", bbuf.position().toLong())
             return rbuf
@@ -203,11 +190,11 @@ public interface FfiConverter<KotlinType, FfiType> {
     fun liftFromRustBuffer(rbuf: RustBuffer.ByValue): KotlinType {
         val byteBuf = rbuf.asByteBuffer()!!
         try {
-            val item = read(byteBuf)
-            if (byteBuf.hasRemaining()) {
-                throw RuntimeException("junk remaining in buffer after lifting, something is very wrong!!")
-            }
-            return item
+           val item = read(byteBuf)
+           if (byteBuf.hasRemaining()) {
+               throw RuntimeException("junk remaining in buffer after lifting, something is very wrong!!")
+           }
+           return item
         } finally {
             RustBuffer.free(rbuf)
         }
@@ -215,9 +202,8 @@ public interface FfiConverter<KotlinType, FfiType> {
 }
 
 // FfiConverter that uses `RustBuffer` as the FfiType
-public interface FfiConverterRustBuffer<KotlinType> : FfiConverter<KotlinType, RustBuffer.ByValue> {
+public interface FfiConverterRustBuffer<KotlinType>: FfiConverter<KotlinType, RustBuffer.ByValue> {
     override fun lift(value: RustBuffer.ByValue) = liftFromRustBuffer(value)
-
     override fun lower(value: KotlinType) = lowerIntoRustBuffer(value)
 }
 // A handful of classes and functions to support the generated data structures.
@@ -230,24 +216,24 @@ internal const val UNIFFI_CALL_UNEXPECTED_ERROR = 2.toByte()
 @Structure.FieldOrder("code", "error_buf")
 internal open class UniffiRustCallStatus : Structure() {
     @JvmField var code: Byte = 0
-
     @JvmField var error_buf: RustBuffer.ByValue = RustBuffer.ByValue()
 
-    class ByValue :
-        UniffiRustCallStatus(),
-        Structure.ByValue
+    class ByValue: UniffiRustCallStatus(), Structure.ByValue
 
-    fun isSuccess(): Boolean = code == UNIFFI_CALL_SUCCESS
+    fun isSuccess(): Boolean {
+        return code == UNIFFI_CALL_SUCCESS
+    }
 
-    fun isError(): Boolean = code == UNIFFI_CALL_ERROR
+    fun isError(): Boolean {
+        return code == UNIFFI_CALL_ERROR
+    }
 
-    fun isPanic(): Boolean = code == UNIFFI_CALL_UNEXPECTED_ERROR
+    fun isPanic(): Boolean {
+        return code == UNIFFI_CALL_UNEXPECTED_ERROR
+    }
 
     companion object {
-        fun create(
-            code: Byte,
-            errorBuf: RustBuffer.ByValue,
-        ): UniffiRustCallStatus.ByValue {
+        fun create(code: Byte, errorBuf: RustBuffer.ByValue): UniffiRustCallStatus.ByValue {
             val callStatus = UniffiRustCallStatus.ByValue()
             callStatus.code = code
             callStatus.error_buf = errorBuf
@@ -256,13 +242,11 @@ internal open class UniffiRustCallStatus : Structure() {
     }
 }
 
-class InternalException(
-    message: String,
-) : kotlin.Exception(message)
+class InternalException(message: String) : kotlin.Exception(message)
 
 // Each top-level error class has a companion object that can lift the error from the call status's rust buffer
 interface UniffiRustCallStatusErrorHandler<E> {
-    fun lift(error_buf: RustBuffer.ByValue): E
+    fun lift(error_buf: RustBuffer.ByValue): E;
 }
 
 // Helpers for calling Rust
@@ -270,10 +254,7 @@ interface UniffiRustCallStatusErrorHandler<E> {
 // synchronize itself
 
 // Call a rust function that returns a Result<>.  Pass in the Error class companion that corresponds to the Err
-private inline fun <U, E : kotlin.Exception> uniffiRustCallWithError(
-    errorHandler: UniffiRustCallStatusErrorHandler<E>,
-    callback: (UniffiRustCallStatus) -> U,
-): U {
+private inline fun <U, E: kotlin.Exception> uniffiRustCallWithError(errorHandler: UniffiRustCallStatusErrorHandler<E>, callback: (UniffiRustCallStatus) -> U): U {
     var status = UniffiRustCallStatus()
     val return_value = callback(status)
     uniffiCheckCallStatus(errorHandler, status)
@@ -281,10 +262,7 @@ private inline fun <U, E : kotlin.Exception> uniffiRustCallWithError(
 }
 
 // Check UniffiRustCallStatus and throw an error if the call wasn't successful
-private fun <E : kotlin.Exception> uniffiCheckCallStatus(
-    errorHandler: UniffiRustCallStatusErrorHandler<E>,
-    status: UniffiRustCallStatus,
-) {
+private fun<E: kotlin.Exception> uniffiCheckCallStatus(errorHandler: UniffiRustCallStatusErrorHandler<E>, status: UniffiRustCallStatus) {
     if (status.isSuccess()) {
         return
     } else if (status.isError()) {
@@ -304,7 +282,7 @@ private fun <E : kotlin.Exception> uniffiCheckCallStatus(
 }
 
 // UniffiRustCallStatusErrorHandler implementation for times when we don't expect a CALL_ERROR
-object UniffiNullRustCallStatusErrorHandler : UniffiRustCallStatusErrorHandler<InternalException> {
+object UniffiNullRustCallStatusErrorHandler: UniffiRustCallStatusErrorHandler<InternalException> {
     override fun lift(error_buf: RustBuffer.ByValue): InternalException {
         RustBuffer.free(error_buf)
         return InternalException("Unexpected CALL_ERROR")
@@ -312,31 +290,32 @@ object UniffiNullRustCallStatusErrorHandler : UniffiRustCallStatusErrorHandler<I
 }
 
 // Call a rust function that returns a plain value
-private inline fun <U> uniffiRustCall(callback: (UniffiRustCallStatus) -> U): U =
-    uniffiRustCallWithError(UniffiNullRustCallStatusErrorHandler, callback)
+private inline fun <U> uniffiRustCall(callback: (UniffiRustCallStatus) -> U): U {
+    return uniffiRustCallWithError(UniffiNullRustCallStatusErrorHandler, callback)
+}
 
-internal inline fun <T> uniffiTraitInterfaceCall(
+internal inline fun<T> uniffiTraitInterfaceCall(
     callStatus: UniffiRustCallStatus,
     makeCall: () -> T,
     writeReturn: (T) -> Unit,
 ) {
     try {
         writeReturn(makeCall())
-    } catch (e: kotlin.Exception) {
+    } catch(e: kotlin.Exception) {
         callStatus.code = UNIFFI_CALL_UNEXPECTED_ERROR
         callStatus.error_buf = FfiConverterString.lower(e.toString())
     }
 }
 
-internal inline fun <T, reified E : Throwable> uniffiTraitInterfaceCallWithError(
+internal inline fun<T, reified E: Throwable> uniffiTraitInterfaceCallWithError(
     callStatus: UniffiRustCallStatus,
     makeCall: () -> T,
     writeReturn: (T) -> Unit,
-    lowerError: (E) -> RustBuffer.ByValue,
+    lowerError: (E) -> RustBuffer.ByValue
 ) {
     try {
         writeReturn(makeCall())
-    } catch (e: kotlin.Exception) {
+    } catch(e: kotlin.Exception) {
         if (e is E) {
             callStatus.code = UNIFFI_CALL_ERROR
             callStatus.error_buf = lowerError(e)
@@ -346,15 +325,12 @@ internal inline fun <T, reified E : Throwable> uniffiTraitInterfaceCallWithError
         }
     }
 }
-
 // Map handles to objects
 //
 // This is used pass an opaque 64-bit handle representing a foreign object to the Rust code.
-internal class UniffiHandleMap<T : Any> {
+internal class UniffiHandleMap<T: Any> {
     private val map = ConcurrentHashMap<Long, T>()
-    private val counter =
-        java.util.concurrent.atomic
-            .AtomicLong(0)
+    private val counter = java.util.concurrent.atomic.AtomicLong(0)
 
     val size: Int
         get() = map.size
@@ -367,10 +343,14 @@ internal class UniffiHandleMap<T : Any> {
     }
 
     // Get an object from the handle map
-    fun get(handle: Long): T = map.get(handle) ?: throw InternalException("UniffiHandleMap.get: Invalid handle")
+    fun get(handle: Long): T {
+        return map.get(handle) ?: throw InternalException("UniffiHandleMap.get: Invalid handle")
+    }
 
     // Remove an entry from the handlemap and get the Kotlin object back
-    fun remove(handle: Long): T = map.remove(handle) ?: throw InternalException("UniffiHandleMap: Invalid handle")
+    fun remove(handle: Long): T {
+        return map.remove(handle) ?: throw InternalException("UniffiHandleMap: Invalid handle")
+    }
 }
 
 // Contains loading, initialization code,
@@ -384,25 +364,22 @@ private fun findLibraryName(componentName: String): String {
     return "uniffi_iroh"
 }
 
-private inline fun <reified Lib : Library> loadIndirect(componentName: String): Lib =
-    Native.load<Lib>(findLibraryName(componentName), Lib::class.java)
+private inline fun <reified Lib : Library> loadIndirect(
+    componentName: String
+): Lib {
+    return Native.load<Lib>(findLibraryName(componentName), Lib::class.java)
+}
 
 // Define FFI callback types
 internal interface UniffiRustFutureContinuationCallback : com.sun.jna.Callback {
-    fun callback(
-        `data`: Long,
-        `pollResult`: Byte,
-    )
+    fun callback(`data`: Long,`pollResult`: Byte,)
 }
-
 internal interface UniffiForeignFutureFree : com.sun.jna.Callback {
-    fun callback(`handle`: Long)
+    fun callback(`handle`: Long,)
 }
-
 internal interface UniffiCallbackInterfaceFree : com.sun.jna.Callback {
-    fun callback(`handle`: Long)
+    fun callback(`handle`: Long,)
 }
-
 @Structure.FieldOrder("handle", "free")
 internal open class UniffiForeignFuture(
     @JvmField internal var `handle`: Long = 0.toLong(),
@@ -411,15 +388,14 @@ internal open class UniffiForeignFuture(
     class UniffiByValue(
         `handle`: Long = 0.toLong(),
         `free`: UniffiForeignFutureFree? = null,
-    ) : UniffiForeignFuture(`handle`, `free`),
-        Structure.ByValue
+    ): UniffiForeignFuture(`handle`,`free`,), Structure.ByValue
 
-    internal fun uniffiSetValue(other: UniffiForeignFuture) {
+   internal fun uniffiSetValue(other: UniffiForeignFuture) {
         `handle` = other.`handle`
         `free` = other.`free`
     }
-}
 
+}
 @Structure.FieldOrder("returnValue", "callStatus")
 internal open class UniffiForeignFutureStructU8(
     @JvmField internal var `returnValue`: Byte = 0.toByte(),
@@ -428,22 +404,17 @@ internal open class UniffiForeignFutureStructU8(
     class UniffiByValue(
         `returnValue`: Byte = 0.toByte(),
         `callStatus`: UniffiRustCallStatus.ByValue = UniffiRustCallStatus.ByValue(),
-    ) : UniffiForeignFutureStructU8(`returnValue`, `callStatus`),
-        Structure.ByValue
+    ): UniffiForeignFutureStructU8(`returnValue`,`callStatus`,), Structure.ByValue
 
-    internal fun uniffiSetValue(other: UniffiForeignFutureStructU8) {
+   internal fun uniffiSetValue(other: UniffiForeignFutureStructU8) {
         `returnValue` = other.`returnValue`
         `callStatus` = other.`callStatus`
     }
-}
 
+}
 internal interface UniffiForeignFutureCompleteU8 : com.sun.jna.Callback {
-    fun callback(
-        `callbackData`: Long,
-        `result`: UniffiForeignFutureStructU8.UniffiByValue,
-    )
+    fun callback(`callbackData`: Long,`result`: UniffiForeignFutureStructU8.UniffiByValue,)
 }
-
 @Structure.FieldOrder("returnValue", "callStatus")
 internal open class UniffiForeignFutureStructI8(
     @JvmField internal var `returnValue`: Byte = 0.toByte(),
@@ -452,22 +423,17 @@ internal open class UniffiForeignFutureStructI8(
     class UniffiByValue(
         `returnValue`: Byte = 0.toByte(),
         `callStatus`: UniffiRustCallStatus.ByValue = UniffiRustCallStatus.ByValue(),
-    ) : UniffiForeignFutureStructI8(`returnValue`, `callStatus`),
-        Structure.ByValue
+    ): UniffiForeignFutureStructI8(`returnValue`,`callStatus`,), Structure.ByValue
 
-    internal fun uniffiSetValue(other: UniffiForeignFutureStructI8) {
+   internal fun uniffiSetValue(other: UniffiForeignFutureStructI8) {
         `returnValue` = other.`returnValue`
         `callStatus` = other.`callStatus`
     }
-}
 
+}
 internal interface UniffiForeignFutureCompleteI8 : com.sun.jna.Callback {
-    fun callback(
-        `callbackData`: Long,
-        `result`: UniffiForeignFutureStructI8.UniffiByValue,
-    )
+    fun callback(`callbackData`: Long,`result`: UniffiForeignFutureStructI8.UniffiByValue,)
 }
-
 @Structure.FieldOrder("returnValue", "callStatus")
 internal open class UniffiForeignFutureStructU16(
     @JvmField internal var `returnValue`: Short = 0.toShort(),
@@ -476,22 +442,17 @@ internal open class UniffiForeignFutureStructU16(
     class UniffiByValue(
         `returnValue`: Short = 0.toShort(),
         `callStatus`: UniffiRustCallStatus.ByValue = UniffiRustCallStatus.ByValue(),
-    ) : UniffiForeignFutureStructU16(`returnValue`, `callStatus`),
-        Structure.ByValue
+    ): UniffiForeignFutureStructU16(`returnValue`,`callStatus`,), Structure.ByValue
 
-    internal fun uniffiSetValue(other: UniffiForeignFutureStructU16) {
+   internal fun uniffiSetValue(other: UniffiForeignFutureStructU16) {
         `returnValue` = other.`returnValue`
         `callStatus` = other.`callStatus`
     }
-}
 
+}
 internal interface UniffiForeignFutureCompleteU16 : com.sun.jna.Callback {
-    fun callback(
-        `callbackData`: Long,
-        `result`: UniffiForeignFutureStructU16.UniffiByValue,
-    )
+    fun callback(`callbackData`: Long,`result`: UniffiForeignFutureStructU16.UniffiByValue,)
 }
-
 @Structure.FieldOrder("returnValue", "callStatus")
 internal open class UniffiForeignFutureStructI16(
     @JvmField internal var `returnValue`: Short = 0.toShort(),
@@ -500,22 +461,17 @@ internal open class UniffiForeignFutureStructI16(
     class UniffiByValue(
         `returnValue`: Short = 0.toShort(),
         `callStatus`: UniffiRustCallStatus.ByValue = UniffiRustCallStatus.ByValue(),
-    ) : UniffiForeignFutureStructI16(`returnValue`, `callStatus`),
-        Structure.ByValue
+    ): UniffiForeignFutureStructI16(`returnValue`,`callStatus`,), Structure.ByValue
 
-    internal fun uniffiSetValue(other: UniffiForeignFutureStructI16) {
+   internal fun uniffiSetValue(other: UniffiForeignFutureStructI16) {
         `returnValue` = other.`returnValue`
         `callStatus` = other.`callStatus`
     }
-}
 
+}
 internal interface UniffiForeignFutureCompleteI16 : com.sun.jna.Callback {
-    fun callback(
-        `callbackData`: Long,
-        `result`: UniffiForeignFutureStructI16.UniffiByValue,
-    )
+    fun callback(`callbackData`: Long,`result`: UniffiForeignFutureStructI16.UniffiByValue,)
 }
-
 @Structure.FieldOrder("returnValue", "callStatus")
 internal open class UniffiForeignFutureStructU32(
     @JvmField internal var `returnValue`: Int = 0,
@@ -524,22 +480,17 @@ internal open class UniffiForeignFutureStructU32(
     class UniffiByValue(
         `returnValue`: Int = 0,
         `callStatus`: UniffiRustCallStatus.ByValue = UniffiRustCallStatus.ByValue(),
-    ) : UniffiForeignFutureStructU32(`returnValue`, `callStatus`),
-        Structure.ByValue
+    ): UniffiForeignFutureStructU32(`returnValue`,`callStatus`,), Structure.ByValue
 
-    internal fun uniffiSetValue(other: UniffiForeignFutureStructU32) {
+   internal fun uniffiSetValue(other: UniffiForeignFutureStructU32) {
         `returnValue` = other.`returnValue`
         `callStatus` = other.`callStatus`
     }
-}
 
+}
 internal interface UniffiForeignFutureCompleteU32 : com.sun.jna.Callback {
-    fun callback(
-        `callbackData`: Long,
-        `result`: UniffiForeignFutureStructU32.UniffiByValue,
-    )
+    fun callback(`callbackData`: Long,`result`: UniffiForeignFutureStructU32.UniffiByValue,)
 }
-
 @Structure.FieldOrder("returnValue", "callStatus")
 internal open class UniffiForeignFutureStructI32(
     @JvmField internal var `returnValue`: Int = 0,
@@ -548,22 +499,17 @@ internal open class UniffiForeignFutureStructI32(
     class UniffiByValue(
         `returnValue`: Int = 0,
         `callStatus`: UniffiRustCallStatus.ByValue = UniffiRustCallStatus.ByValue(),
-    ) : UniffiForeignFutureStructI32(`returnValue`, `callStatus`),
-        Structure.ByValue
+    ): UniffiForeignFutureStructI32(`returnValue`,`callStatus`,), Structure.ByValue
 
-    internal fun uniffiSetValue(other: UniffiForeignFutureStructI32) {
+   internal fun uniffiSetValue(other: UniffiForeignFutureStructI32) {
         `returnValue` = other.`returnValue`
         `callStatus` = other.`callStatus`
     }
-}
 
+}
 internal interface UniffiForeignFutureCompleteI32 : com.sun.jna.Callback {
-    fun callback(
-        `callbackData`: Long,
-        `result`: UniffiForeignFutureStructI32.UniffiByValue,
-    )
+    fun callback(`callbackData`: Long,`result`: UniffiForeignFutureStructI32.UniffiByValue,)
 }
-
 @Structure.FieldOrder("returnValue", "callStatus")
 internal open class UniffiForeignFutureStructU64(
     @JvmField internal var `returnValue`: Long = 0.toLong(),
@@ -572,22 +518,17 @@ internal open class UniffiForeignFutureStructU64(
     class UniffiByValue(
         `returnValue`: Long = 0.toLong(),
         `callStatus`: UniffiRustCallStatus.ByValue = UniffiRustCallStatus.ByValue(),
-    ) : UniffiForeignFutureStructU64(`returnValue`, `callStatus`),
-        Structure.ByValue
+    ): UniffiForeignFutureStructU64(`returnValue`,`callStatus`,), Structure.ByValue
 
-    internal fun uniffiSetValue(other: UniffiForeignFutureStructU64) {
+   internal fun uniffiSetValue(other: UniffiForeignFutureStructU64) {
         `returnValue` = other.`returnValue`
         `callStatus` = other.`callStatus`
     }
-}
 
+}
 internal interface UniffiForeignFutureCompleteU64 : com.sun.jna.Callback {
-    fun callback(
-        `callbackData`: Long,
-        `result`: UniffiForeignFutureStructU64.UniffiByValue,
-    )
+    fun callback(`callbackData`: Long,`result`: UniffiForeignFutureStructU64.UniffiByValue,)
 }
-
 @Structure.FieldOrder("returnValue", "callStatus")
 internal open class UniffiForeignFutureStructI64(
     @JvmField internal var `returnValue`: Long = 0.toLong(),
@@ -596,22 +537,17 @@ internal open class UniffiForeignFutureStructI64(
     class UniffiByValue(
         `returnValue`: Long = 0.toLong(),
         `callStatus`: UniffiRustCallStatus.ByValue = UniffiRustCallStatus.ByValue(),
-    ) : UniffiForeignFutureStructI64(`returnValue`, `callStatus`),
-        Structure.ByValue
+    ): UniffiForeignFutureStructI64(`returnValue`,`callStatus`,), Structure.ByValue
 
-    internal fun uniffiSetValue(other: UniffiForeignFutureStructI64) {
+   internal fun uniffiSetValue(other: UniffiForeignFutureStructI64) {
         `returnValue` = other.`returnValue`
         `callStatus` = other.`callStatus`
     }
-}
 
+}
 internal interface UniffiForeignFutureCompleteI64 : com.sun.jna.Callback {
-    fun callback(
-        `callbackData`: Long,
-        `result`: UniffiForeignFutureStructI64.UniffiByValue,
-    )
+    fun callback(`callbackData`: Long,`result`: UniffiForeignFutureStructI64.UniffiByValue,)
 }
-
 @Structure.FieldOrder("returnValue", "callStatus")
 internal open class UniffiForeignFutureStructF32(
     @JvmField internal var `returnValue`: Float = 0.0f,
@@ -620,22 +556,17 @@ internal open class UniffiForeignFutureStructF32(
     class UniffiByValue(
         `returnValue`: Float = 0.0f,
         `callStatus`: UniffiRustCallStatus.ByValue = UniffiRustCallStatus.ByValue(),
-    ) : UniffiForeignFutureStructF32(`returnValue`, `callStatus`),
-        Structure.ByValue
+    ): UniffiForeignFutureStructF32(`returnValue`,`callStatus`,), Structure.ByValue
 
-    internal fun uniffiSetValue(other: UniffiForeignFutureStructF32) {
+   internal fun uniffiSetValue(other: UniffiForeignFutureStructF32) {
         `returnValue` = other.`returnValue`
         `callStatus` = other.`callStatus`
     }
-}
 
+}
 internal interface UniffiForeignFutureCompleteF32 : com.sun.jna.Callback {
-    fun callback(
-        `callbackData`: Long,
-        `result`: UniffiForeignFutureStructF32.UniffiByValue,
-    )
+    fun callback(`callbackData`: Long,`result`: UniffiForeignFutureStructF32.UniffiByValue,)
 }
-
 @Structure.FieldOrder("returnValue", "callStatus")
 internal open class UniffiForeignFutureStructF64(
     @JvmField internal var `returnValue`: Double = 0.0,
@@ -644,22 +575,17 @@ internal open class UniffiForeignFutureStructF64(
     class UniffiByValue(
         `returnValue`: Double = 0.0,
         `callStatus`: UniffiRustCallStatus.ByValue = UniffiRustCallStatus.ByValue(),
-    ) : UniffiForeignFutureStructF64(`returnValue`, `callStatus`),
-        Structure.ByValue
+    ): UniffiForeignFutureStructF64(`returnValue`,`callStatus`,), Structure.ByValue
 
-    internal fun uniffiSetValue(other: UniffiForeignFutureStructF64) {
+   internal fun uniffiSetValue(other: UniffiForeignFutureStructF64) {
         `returnValue` = other.`returnValue`
         `callStatus` = other.`callStatus`
     }
-}
 
+}
 internal interface UniffiForeignFutureCompleteF64 : com.sun.jna.Callback {
-    fun callback(
-        `callbackData`: Long,
-        `result`: UniffiForeignFutureStructF64.UniffiByValue,
-    )
+    fun callback(`callbackData`: Long,`result`: UniffiForeignFutureStructF64.UniffiByValue,)
 }
-
 @Structure.FieldOrder("returnValue", "callStatus")
 internal open class UniffiForeignFutureStructPointer(
     @JvmField internal var `returnValue`: Pointer = Pointer.NULL,
@@ -668,22 +594,17 @@ internal open class UniffiForeignFutureStructPointer(
     class UniffiByValue(
         `returnValue`: Pointer = Pointer.NULL,
         `callStatus`: UniffiRustCallStatus.ByValue = UniffiRustCallStatus.ByValue(),
-    ) : UniffiForeignFutureStructPointer(`returnValue`, `callStatus`),
-        Structure.ByValue
+    ): UniffiForeignFutureStructPointer(`returnValue`,`callStatus`,), Structure.ByValue
 
-    internal fun uniffiSetValue(other: UniffiForeignFutureStructPointer) {
+   internal fun uniffiSetValue(other: UniffiForeignFutureStructPointer) {
         `returnValue` = other.`returnValue`
         `callStatus` = other.`callStatus`
     }
-}
 
+}
 internal interface UniffiForeignFutureCompletePointer : com.sun.jna.Callback {
-    fun callback(
-        `callbackData`: Long,
-        `result`: UniffiForeignFutureStructPointer.UniffiByValue,
-    )
+    fun callback(`callbackData`: Long,`result`: UniffiForeignFutureStructPointer.UniffiByValue,)
 }
-
 @Structure.FieldOrder("returnValue", "callStatus")
 internal open class UniffiForeignFutureStructRustBuffer(
     @JvmField internal var `returnValue`: RustBuffer.ByValue = RustBuffer.ByValue(),
@@ -692,88 +613,48 @@ internal open class UniffiForeignFutureStructRustBuffer(
     class UniffiByValue(
         `returnValue`: RustBuffer.ByValue = RustBuffer.ByValue(),
         `callStatus`: UniffiRustCallStatus.ByValue = UniffiRustCallStatus.ByValue(),
-    ) : UniffiForeignFutureStructRustBuffer(`returnValue`, `callStatus`),
-        Structure.ByValue
+    ): UniffiForeignFutureStructRustBuffer(`returnValue`,`callStatus`,), Structure.ByValue
 
-    internal fun uniffiSetValue(other: UniffiForeignFutureStructRustBuffer) {
+   internal fun uniffiSetValue(other: UniffiForeignFutureStructRustBuffer) {
         `returnValue` = other.`returnValue`
         `callStatus` = other.`callStatus`
     }
-}
 
+}
 internal interface UniffiForeignFutureCompleteRustBuffer : com.sun.jna.Callback {
-    fun callback(
-        `callbackData`: Long,
-        `result`: UniffiForeignFutureStructRustBuffer.UniffiByValue,
-    )
+    fun callback(`callbackData`: Long,`result`: UniffiForeignFutureStructRustBuffer.UniffiByValue,)
 }
-
 @Structure.FieldOrder("callStatus")
 internal open class UniffiForeignFutureStructVoid(
     @JvmField internal var `callStatus`: UniffiRustCallStatus.ByValue = UniffiRustCallStatus.ByValue(),
 ) : Structure() {
     class UniffiByValue(
         `callStatus`: UniffiRustCallStatus.ByValue = UniffiRustCallStatus.ByValue(),
-    ) : UniffiForeignFutureStructVoid(`callStatus`),
-        Structure.ByValue
+    ): UniffiForeignFutureStructVoid(`callStatus`,), Structure.ByValue
 
-    internal fun uniffiSetValue(other: UniffiForeignFutureStructVoid) {
+   internal fun uniffiSetValue(other: UniffiForeignFutureStructVoid) {
         `callStatus` = other.`callStatus`
     }
-}
 
+}
 internal interface UniffiForeignFutureCompleteVoid : com.sun.jna.Callback {
-    fun callback(
-        `callbackData`: Long,
-        `result`: UniffiForeignFutureStructVoid.UniffiByValue,
-    )
+    fun callback(`callbackData`: Long,`result`: UniffiForeignFutureStructVoid.UniffiByValue,)
 }
-
 internal interface UniffiCallbackInterfaceAddCallbackMethod0 : com.sun.jna.Callback {
-    fun callback(
-        `uniffiHandle`: Long,
-        `progress`: Pointer,
-        `uniffiOutReturn`: Pointer,
-        uniffiCallStatus: UniffiRustCallStatus,
-    )
+    fun callback(`uniffiHandle`: Long,`progress`: Pointer,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,)
 }
-
 internal interface UniffiCallbackInterfaceDocExportFileCallbackMethod0 : com.sun.jna.Callback {
-    fun callback(
-        `uniffiHandle`: Long,
-        `progress`: Pointer,
-        `uniffiOutReturn`: Pointer,
-        uniffiCallStatus: UniffiRustCallStatus,
-    )
+    fun callback(`uniffiHandle`: Long,`progress`: Pointer,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,)
 }
-
 internal interface UniffiCallbackInterfaceDocImportFileCallbackMethod0 : com.sun.jna.Callback {
-    fun callback(
-        `uniffiHandle`: Long,
-        `progress`: Pointer,
-        `uniffiOutReturn`: Pointer,
-        uniffiCallStatus: UniffiRustCallStatus,
-    )
+    fun callback(`uniffiHandle`: Long,`progress`: Pointer,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,)
 }
-
 internal interface UniffiCallbackInterfaceDownloadCallbackMethod0 : com.sun.jna.Callback {
-    fun callback(
-        `uniffiHandle`: Long,
-        `progress`: Pointer,
-        `uniffiOutReturn`: Pointer,
-        uniffiCallStatus: UniffiRustCallStatus,
-    )
+    fun callback(`uniffiHandle`: Long,`progress`: Pointer,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,)
 }
-
 internal interface UniffiCallbackInterfaceSubscribeCallbackMethod0 : com.sun.jna.Callback {
-    fun callback(
-        `uniffiHandle`: Long,
-        `event`: Pointer,
-        `uniffiOutReturn`: Pointer,
-        uniffiCallStatus: UniffiRustCallStatus,
-    )
+    fun callback(`uniffiHandle`: Long,`event`: Pointer,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,)
 }
-
 @Structure.FieldOrder("progress", "uniffiFree")
 internal open class UniffiVTableCallbackInterfaceAddCallback(
     @JvmField internal var `progress`: UniffiCallbackInterfaceAddCallbackMethod0? = null,
@@ -782,15 +663,14 @@ internal open class UniffiVTableCallbackInterfaceAddCallback(
     class UniffiByValue(
         `progress`: UniffiCallbackInterfaceAddCallbackMethod0? = null,
         `uniffiFree`: UniffiCallbackInterfaceFree? = null,
-    ) : UniffiVTableCallbackInterfaceAddCallback(`progress`, `uniffiFree`),
-        Structure.ByValue
+    ): UniffiVTableCallbackInterfaceAddCallback(`progress`,`uniffiFree`,), Structure.ByValue
 
-    internal fun uniffiSetValue(other: UniffiVTableCallbackInterfaceAddCallback) {
+   internal fun uniffiSetValue(other: UniffiVTableCallbackInterfaceAddCallback) {
         `progress` = other.`progress`
         `uniffiFree` = other.`uniffiFree`
     }
-}
 
+}
 @Structure.FieldOrder("progress", "uniffiFree")
 internal open class UniffiVTableCallbackInterfaceDocExportFileCallback(
     @JvmField internal var `progress`: UniffiCallbackInterfaceDocExportFileCallbackMethod0? = null,
@@ -799,15 +679,14 @@ internal open class UniffiVTableCallbackInterfaceDocExportFileCallback(
     class UniffiByValue(
         `progress`: UniffiCallbackInterfaceDocExportFileCallbackMethod0? = null,
         `uniffiFree`: UniffiCallbackInterfaceFree? = null,
-    ) : UniffiVTableCallbackInterfaceDocExportFileCallback(`progress`, `uniffiFree`),
-        Structure.ByValue
+    ): UniffiVTableCallbackInterfaceDocExportFileCallback(`progress`,`uniffiFree`,), Structure.ByValue
 
-    internal fun uniffiSetValue(other: UniffiVTableCallbackInterfaceDocExportFileCallback) {
+   internal fun uniffiSetValue(other: UniffiVTableCallbackInterfaceDocExportFileCallback) {
         `progress` = other.`progress`
         `uniffiFree` = other.`uniffiFree`
     }
-}
 
+}
 @Structure.FieldOrder("progress", "uniffiFree")
 internal open class UniffiVTableCallbackInterfaceDocImportFileCallback(
     @JvmField internal var `progress`: UniffiCallbackInterfaceDocImportFileCallbackMethod0? = null,
@@ -816,15 +695,14 @@ internal open class UniffiVTableCallbackInterfaceDocImportFileCallback(
     class UniffiByValue(
         `progress`: UniffiCallbackInterfaceDocImportFileCallbackMethod0? = null,
         `uniffiFree`: UniffiCallbackInterfaceFree? = null,
-    ) : UniffiVTableCallbackInterfaceDocImportFileCallback(`progress`, `uniffiFree`),
-        Structure.ByValue
+    ): UniffiVTableCallbackInterfaceDocImportFileCallback(`progress`,`uniffiFree`,), Structure.ByValue
 
-    internal fun uniffiSetValue(other: UniffiVTableCallbackInterfaceDocImportFileCallback) {
+   internal fun uniffiSetValue(other: UniffiVTableCallbackInterfaceDocImportFileCallback) {
         `progress` = other.`progress`
         `uniffiFree` = other.`uniffiFree`
     }
-}
 
+}
 @Structure.FieldOrder("progress", "uniffiFree")
 internal open class UniffiVTableCallbackInterfaceDownloadCallback(
     @JvmField internal var `progress`: UniffiCallbackInterfaceDownloadCallbackMethod0? = null,
@@ -833,15 +711,14 @@ internal open class UniffiVTableCallbackInterfaceDownloadCallback(
     class UniffiByValue(
         `progress`: UniffiCallbackInterfaceDownloadCallbackMethod0? = null,
         `uniffiFree`: UniffiCallbackInterfaceFree? = null,
-    ) : UniffiVTableCallbackInterfaceDownloadCallback(`progress`, `uniffiFree`),
-        Structure.ByValue
+    ): UniffiVTableCallbackInterfaceDownloadCallback(`progress`,`uniffiFree`,), Structure.ByValue
 
-    internal fun uniffiSetValue(other: UniffiVTableCallbackInterfaceDownloadCallback) {
+   internal fun uniffiSetValue(other: UniffiVTableCallbackInterfaceDownloadCallback) {
         `progress` = other.`progress`
         `uniffiFree` = other.`uniffiFree`
     }
-}
 
+}
 @Structure.FieldOrder("event", "uniffiFree")
 internal open class UniffiVTableCallbackInterfaceSubscribeCallback(
     @JvmField internal var `event`: UniffiCallbackInterfaceSubscribeCallbackMethod0? = null,
@@ -850,14 +727,479 @@ internal open class UniffiVTableCallbackInterfaceSubscribeCallback(
     class UniffiByValue(
         `event`: UniffiCallbackInterfaceSubscribeCallbackMethod0? = null,
         `uniffiFree`: UniffiCallbackInterfaceFree? = null,
-    ) : UniffiVTableCallbackInterfaceSubscribeCallback(`event`, `uniffiFree`),
-        Structure.ByValue
+    ): UniffiVTableCallbackInterfaceSubscribeCallback(`event`,`uniffiFree`,), Structure.ByValue
 
-    internal fun uniffiSetValue(other: UniffiVTableCallbackInterfaceSubscribeCallback) {
+   internal fun uniffiSetValue(other: UniffiVTableCallbackInterfaceSubscribeCallback) {
         `event` = other.`event`
         `uniffiFree` = other.`uniffiFree`
     }
+
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 // A JNA Library to expose the extern-C FFI definitions.
 // This is an implementation detail which will be called internally by the public API.
@@ -866,1837 +1208,954 @@ internal interface UniffiLib : Library {
     companion object {
         internal val INSTANCE: UniffiLib by lazy {
             loadIndirect<UniffiLib>(componentName = "iroh")
-                .also { lib: UniffiLib ->
-                    uniffiCheckContractApiVersion(lib)
-                    uniffiCheckApiChecksums(lib)
-                    uniffiCallbackInterfaceAddCallback.register(lib)
-                    uniffiCallbackInterfaceDocExportFileCallback.register(lib)
-                    uniffiCallbackInterfaceDocImportFileCallback.register(lib)
-                    uniffiCallbackInterfaceDownloadCallback.register(lib)
-                    uniffiCallbackInterfaceSubscribeCallback.register(lib)
+            .also { lib: UniffiLib ->
+                uniffiCheckContractApiVersion(lib)
+                uniffiCheckApiChecksums(lib)
+                uniffiCallbackInterfaceAddCallback.register(lib)
+                uniffiCallbackInterfaceDocExportFileCallback.register(lib)
+                uniffiCallbackInterfaceDocImportFileCallback.register(lib)
+                uniffiCallbackInterfaceDownloadCallback.register(lib)
+                uniffiCallbackInterfaceSubscribeCallback.register(lib)
                 }
         }
-
+        
         // The Cleaner for the whole library
         internal val CLEANER: UniffiCleaner by lazy {
             UniffiCleaner.create()
         }
     }
 
-    fun uniffi_iroh_fn_clone_addcallback(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_clone_addcallback(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Pointer
-
-    fun uniffi_iroh_fn_free_addcallback(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_free_addcallback(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
-
-    fun uniffi_iroh_fn_init_callback_vtable_addcallback(`vtable`: UniffiVTableCallbackInterfaceAddCallback): Unit
-
-    fun uniffi_iroh_fn_method_addcallback_progress(
-        `ptr`: Pointer,
-        `progress`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_init_callback_vtable_addcallback(`vtable`: UniffiVTableCallbackInterfaceAddCallback,
     ): Unit
-
-    fun uniffi_iroh_fn_clone_addprogress(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Pointer
-
-    fun uniffi_iroh_fn_free_addprogress(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_method_addcallback_progress(`ptr`: Pointer,`progress`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
-
-    fun uniffi_iroh_fn_method_addprogress_as_abort(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): RustBuffer.ByValue
-
-    fun uniffi_iroh_fn_method_addprogress_as_all_done(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): RustBuffer.ByValue
-
-    fun uniffi_iroh_fn_method_addprogress_as_done(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): RustBuffer.ByValue
-
-    fun uniffi_iroh_fn_method_addprogress_as_found(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): RustBuffer.ByValue
-
-    fun uniffi_iroh_fn_method_addprogress_as_progress(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): RustBuffer.ByValue
-
-    fun uniffi_iroh_fn_method_addprogress_type(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): RustBuffer.ByValue
-
-    fun uniffi_iroh_fn_clone_author(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_clone_addprogress(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Pointer
-
-    fun uniffi_iroh_fn_free_author(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_free_addprogress(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
-
-    fun uniffi_iroh_fn_constructor_author_from_string(
-        `str`: RustBuffer.ByValue,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Pointer
-
-    fun uniffi_iroh_fn_method_author_id(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Pointer
-
-    fun uniffi_iroh_fn_method_author_uniffi_trait_display(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_method_addprogress_as_abort(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
-
-    fun uniffi_iroh_fn_clone_authorid(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_method_addprogress_as_all_done(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    fun uniffi_iroh_fn_method_addprogress_as_done(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    fun uniffi_iroh_fn_method_addprogress_as_found(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    fun uniffi_iroh_fn_method_addprogress_as_progress(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    fun uniffi_iroh_fn_method_addprogress_type(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    fun uniffi_iroh_fn_clone_author(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Pointer
-
-    fun uniffi_iroh_fn_free_authorid(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_free_author(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
-
-    fun uniffi_iroh_fn_constructor_authorid_from_string(
-        `str`: RustBuffer.ByValue,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_constructor_author_from_string(`str`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Pointer
-
-    fun uniffi_iroh_fn_method_authorid_equal(
-        `ptr`: Pointer,
-        `other`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_method_author_id(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): Pointer
+    fun uniffi_iroh_fn_method_author_uniffi_trait_display(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    fun uniffi_iroh_fn_clone_authorid(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): Pointer
+    fun uniffi_iroh_fn_free_authorid(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    fun uniffi_iroh_fn_constructor_authorid_from_string(`str`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Pointer
+    fun uniffi_iroh_fn_method_authorid_equal(`ptr`: Pointer,`other`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Byte
-
-    fun uniffi_iroh_fn_method_authorid_uniffi_trait_display(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_method_authorid_uniffi_trait_display(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
-
-    fun uniffi_iroh_fn_clone_blobdownloadoptions(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_clone_blobdownloadoptions(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Pointer
-
-    fun uniffi_iroh_fn_free_blobdownloadoptions(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_free_blobdownloadoptions(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
-
-    fun uniffi_iroh_fn_constructor_blobdownloadoptions_new(
-        `format`: RustBuffer.ByValue,
-        `node`: Pointer,
-        `tag`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_constructor_blobdownloadoptions_new(`format`: RustBuffer.ByValue,`node`: Pointer,`tag`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Pointer
-
-    fun uniffi_iroh_fn_clone_blobticket(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_clone_blobticket(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Pointer
-
-    fun uniffi_iroh_fn_free_blobticket(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_free_blobticket(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
-
-    fun uniffi_iroh_fn_constructor_blobticket_new(
-        `ticket`: RustBuffer.ByValue,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_constructor_blobticket_new(`ticket`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Pointer
-
-    fun uniffi_iroh_fn_method_blobticket_as_download_options(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_method_blobticket_as_download_options(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Pointer
-
-    fun uniffi_iroh_fn_method_blobticket_format(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_method_blobticket_format(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
-
-    fun uniffi_iroh_fn_method_blobticket_hash(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_method_blobticket_hash(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Pointer
-
-    fun uniffi_iroh_fn_method_blobticket_node_addr(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_method_blobticket_node_addr(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Pointer
-
-    fun uniffi_iroh_fn_clone_collection(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_clone_collection(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Pointer
-
-    fun uniffi_iroh_fn_free_collection(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_free_collection(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
-
-    fun uniffi_iroh_fn_constructor_collection_new(uniffi_out_err: UniffiRustCallStatus): Pointer
-
-    fun uniffi_iroh_fn_method_collection_blobs(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_constructor_collection_new(uniffi_out_err: UniffiRustCallStatus, 
+    ): Pointer
+    fun uniffi_iroh_fn_method_collection_blobs(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
-
-    fun uniffi_iroh_fn_method_collection_is_empty(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_method_collection_is_empty(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Byte
-
-    fun uniffi_iroh_fn_method_collection_len(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_method_collection_len(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Long
-
-    fun uniffi_iroh_fn_method_collection_links(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_method_collection_links(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
-
-    fun uniffi_iroh_fn_method_collection_names(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_method_collection_names(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
-
-    fun uniffi_iroh_fn_method_collection_push(
-        `ptr`: Pointer,
-        `name`: RustBuffer.ByValue,
-        `hash`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_method_collection_push(`ptr`: Pointer,`name`: RustBuffer.ByValue,`hash`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
-
-    fun uniffi_iroh_fn_clone_connectiontype(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_clone_connectiontype(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Pointer
-
-    fun uniffi_iroh_fn_free_connectiontype(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_free_connectiontype(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
-
-    fun uniffi_iroh_fn_method_connectiontype_as_direct(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_method_connectiontype_as_direct(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
-
-    fun uniffi_iroh_fn_method_connectiontype_as_mixed(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_method_connectiontype_as_mixed(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
-
-    fun uniffi_iroh_fn_method_connectiontype_as_relay(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_method_connectiontype_as_relay(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
-
-    fun uniffi_iroh_fn_method_connectiontype_type(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_method_connectiontype_type(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
-
-    fun uniffi_iroh_fn_clone_directaddrinfo(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_clone_directaddrinfo(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Pointer
-
-    fun uniffi_iroh_fn_free_directaddrinfo(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_free_directaddrinfo(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
-
-    fun uniffi_iroh_fn_method_directaddrinfo_addr(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_method_directaddrinfo_addr(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
-
-    fun uniffi_iroh_fn_method_directaddrinfo_last_control(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_method_directaddrinfo_last_control(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
-
-    fun uniffi_iroh_fn_method_directaddrinfo_last_payload(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_method_directaddrinfo_last_payload(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
-
-    fun uniffi_iroh_fn_method_directaddrinfo_latency(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_method_directaddrinfo_latency(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
-
-    fun uniffi_iroh_fn_clone_doc(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_clone_doc(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Pointer
-
-    fun uniffi_iroh_fn_free_doc(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_free_doc(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
-
-    fun uniffi_iroh_fn_method_doc_close_me(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_method_doc_close_me(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
-
-    fun uniffi_iroh_fn_method_doc_del(
-        `ptr`: Pointer,
-        `authorId`: Pointer,
-        `prefix`: RustBuffer.ByValue,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_method_doc_del(`ptr`: Pointer,`authorId`: Pointer,`prefix`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Long
-
-    fun uniffi_iroh_fn_method_doc_export_file(
-        `ptr`: Pointer,
-        `entry`: Pointer,
-        `path`: RustBuffer.ByValue,
-        `cb`: RustBuffer.ByValue,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_method_doc_export_file(`ptr`: Pointer,`entry`: Pointer,`path`: RustBuffer.ByValue,`cb`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
-
-    fun uniffi_iroh_fn_method_doc_get_download_policy(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_method_doc_get_download_policy(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Pointer
-
-    fun uniffi_iroh_fn_method_doc_get_exact(
-        `ptr`: Pointer,
-        `author`: Pointer,
-        `key`: RustBuffer.ByValue,
-        `includeEmpty`: Byte,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_method_doc_get_exact(`ptr`: Pointer,`author`: Pointer,`key`: RustBuffer.ByValue,`includeEmpty`: Byte,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
-
-    fun uniffi_iroh_fn_method_doc_get_many(
-        `ptr`: Pointer,
-        `query`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_method_doc_get_many(`ptr`: Pointer,`query`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
-
-    fun uniffi_iroh_fn_method_doc_get_one(
-        `ptr`: Pointer,
-        `query`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_method_doc_get_one(`ptr`: Pointer,`query`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
-
-    fun uniffi_iroh_fn_method_doc_id(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_method_doc_id(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
-
-    fun uniffi_iroh_fn_method_doc_import_file(
-        `ptr`: Pointer,
-        `author`: Pointer,
-        `key`: RustBuffer.ByValue,
-        `path`: RustBuffer.ByValue,
-        `inPlace`: Byte,
-        `cb`: RustBuffer.ByValue,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_method_doc_import_file(`ptr`: Pointer,`author`: Pointer,`key`: RustBuffer.ByValue,`path`: RustBuffer.ByValue,`inPlace`: Byte,`cb`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
-
-    fun uniffi_iroh_fn_method_doc_leave(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_method_doc_leave(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
-
-    fun uniffi_iroh_fn_method_doc_set_bytes(
-        `ptr`: Pointer,
-        `author`: Pointer,
-        `key`: RustBuffer.ByValue,
-        `value`: RustBuffer.ByValue,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_method_doc_set_bytes(`ptr`: Pointer,`author`: Pointer,`key`: RustBuffer.ByValue,`value`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Pointer
-
-    fun uniffi_iroh_fn_method_doc_set_download_policy(
-        `ptr`: Pointer,
-        `policy`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_method_doc_set_download_policy(`ptr`: Pointer,`policy`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
-
-    fun uniffi_iroh_fn_method_doc_set_hash(
-        `ptr`: Pointer,
-        `author`: Pointer,
-        `key`: RustBuffer.ByValue,
-        `hash`: Pointer,
-        `size`: Long,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_method_doc_set_hash(`ptr`: Pointer,`author`: Pointer,`key`: RustBuffer.ByValue,`hash`: Pointer,`size`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
-
-    fun uniffi_iroh_fn_method_doc_share(
-        `ptr`: Pointer,
-        `mode`: RustBuffer.ByValue,
-        `addrOptions`: RustBuffer.ByValue,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_method_doc_share(`ptr`: Pointer,`mode`: RustBuffer.ByValue,`addrOptions`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
-
-    fun uniffi_iroh_fn_method_doc_start_sync(
-        `ptr`: Pointer,
-        `peers`: RustBuffer.ByValue,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_method_doc_start_sync(`ptr`: Pointer,`peers`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
-
-    fun uniffi_iroh_fn_method_doc_status(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_method_doc_status(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
-
-    fun uniffi_iroh_fn_method_doc_subscribe(
-        `ptr`: Pointer,
-        `cb`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_method_doc_subscribe(`ptr`: Pointer,`cb`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
-
-    fun uniffi_iroh_fn_clone_docexportfilecallback(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_clone_docexportfilecallback(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Pointer
-
-    fun uniffi_iroh_fn_free_docexportfilecallback(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_free_docexportfilecallback(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
-
-    fun uniffi_iroh_fn_init_callback_vtable_docexportfilecallback(`vtable`: UniffiVTableCallbackInterfaceDocExportFileCallback): Unit
-
-    fun uniffi_iroh_fn_method_docexportfilecallback_progress(
-        `ptr`: Pointer,
-        `progress`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_init_callback_vtable_docexportfilecallback(`vtable`: UniffiVTableCallbackInterfaceDocExportFileCallback,
     ): Unit
-
-    fun uniffi_iroh_fn_clone_docexportprogress(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Pointer
-
-    fun uniffi_iroh_fn_free_docexportprogress(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_method_docexportfilecallback_progress(`ptr`: Pointer,`progress`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
-
-    fun uniffi_iroh_fn_method_docexportprogress_as_abort(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): RustBuffer.ByValue
-
-    fun uniffi_iroh_fn_method_docexportprogress_as_found(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): RustBuffer.ByValue
-
-    fun uniffi_iroh_fn_method_docexportprogress_as_progress(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): RustBuffer.ByValue
-
-    fun uniffi_iroh_fn_method_docexportprogress_type(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): RustBuffer.ByValue
-
-    fun uniffi_iroh_fn_clone_docimportfilecallback(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_clone_docexportprogress(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Pointer
-
-    fun uniffi_iroh_fn_free_docimportfilecallback(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_free_docexportprogress(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
-
-    fun uniffi_iroh_fn_init_callback_vtable_docimportfilecallback(`vtable`: UniffiVTableCallbackInterfaceDocImportFileCallback): Unit
-
-    fun uniffi_iroh_fn_method_docimportfilecallback_progress(
-        `ptr`: Pointer,
-        `progress`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_method_docexportprogress_as_abort(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    fun uniffi_iroh_fn_method_docexportprogress_as_found(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    fun uniffi_iroh_fn_method_docexportprogress_as_progress(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    fun uniffi_iroh_fn_method_docexportprogress_type(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    fun uniffi_iroh_fn_clone_docimportfilecallback(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): Pointer
+    fun uniffi_iroh_fn_free_docimportfilecallback(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
-
-    fun uniffi_iroh_fn_clone_docimportprogress(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Pointer
-
-    fun uniffi_iroh_fn_free_docimportprogress(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_init_callback_vtable_docimportfilecallback(`vtable`: UniffiVTableCallbackInterfaceDocImportFileCallback,
     ): Unit
-
-    fun uniffi_iroh_fn_method_docimportprogress_as_abort(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): RustBuffer.ByValue
-
-    fun uniffi_iroh_fn_method_docimportprogress_as_all_done(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): RustBuffer.ByValue
-
-    fun uniffi_iroh_fn_method_docimportprogress_as_found(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): RustBuffer.ByValue
-
-    fun uniffi_iroh_fn_method_docimportprogress_as_ingest_done(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): RustBuffer.ByValue
-
-    fun uniffi_iroh_fn_method_docimportprogress_as_progress(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): RustBuffer.ByValue
-
-    fun uniffi_iroh_fn_method_docimportprogress_type(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): RustBuffer.ByValue
-
-    fun uniffi_iroh_fn_clone_downloadcallback(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Pointer
-
-    fun uniffi_iroh_fn_free_downloadcallback(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_method_docimportfilecallback_progress(`ptr`: Pointer,`progress`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
-
-    fun uniffi_iroh_fn_init_callback_vtable_downloadcallback(`vtable`: UniffiVTableCallbackInterfaceDownloadCallback): Unit
-
-    fun uniffi_iroh_fn_method_downloadcallback_progress(
-        `ptr`: Pointer,
-        `progress`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_clone_docimportprogress(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): Pointer
+    fun uniffi_iroh_fn_free_docimportprogress(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
-
-    fun uniffi_iroh_fn_clone_downloadpolicy(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_method_docimportprogress_as_abort(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    fun uniffi_iroh_fn_method_docimportprogress_as_all_done(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    fun uniffi_iroh_fn_method_docimportprogress_as_found(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    fun uniffi_iroh_fn_method_docimportprogress_as_ingest_done(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    fun uniffi_iroh_fn_method_docimportprogress_as_progress(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    fun uniffi_iroh_fn_method_docimportprogress_type(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    fun uniffi_iroh_fn_clone_downloadcallback(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Pointer
-
-    fun uniffi_iroh_fn_free_downloadpolicy(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_free_downloadcallback(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
-
-    fun uniffi_iroh_fn_constructor_downloadpolicy_everything(uniffi_out_err: UniffiRustCallStatus): Pointer
-
-    fun uniffi_iroh_fn_constructor_downloadpolicy_everything_except(
-        `filters`: RustBuffer.ByValue,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Pointer
-
-    fun uniffi_iroh_fn_constructor_downloadpolicy_nothing(uniffi_out_err: UniffiRustCallStatus): Pointer
-
-    fun uniffi_iroh_fn_constructor_downloadpolicy_nothing_except(
-        `filters`: RustBuffer.ByValue,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Pointer
-
-    fun uniffi_iroh_fn_clone_downloadprogress(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Pointer
-
-    fun uniffi_iroh_fn_free_downloadprogress(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_init_callback_vtable_downloadcallback(`vtable`: UniffiVTableCallbackInterfaceDownloadCallback,
     ): Unit
-
-    fun uniffi_iroh_fn_method_downloadprogress_as_abort(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): RustBuffer.ByValue
-
-    fun uniffi_iroh_fn_method_downloadprogress_as_all_done(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): RustBuffer.ByValue
-
-    fun uniffi_iroh_fn_method_downloadprogress_as_done(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): RustBuffer.ByValue
-
-    fun uniffi_iroh_fn_method_downloadprogress_as_found(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): RustBuffer.ByValue
-
-    fun uniffi_iroh_fn_method_downloadprogress_as_found_hash_seq(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): RustBuffer.ByValue
-
-    fun uniffi_iroh_fn_method_downloadprogress_as_found_local(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): RustBuffer.ByValue
-
-    fun uniffi_iroh_fn_method_downloadprogress_as_progress(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): RustBuffer.ByValue
-
-    fun uniffi_iroh_fn_method_downloadprogress_type(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): RustBuffer.ByValue
-
-    fun uniffi_iroh_fn_clone_entry(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Pointer
-
-    fun uniffi_iroh_fn_free_entry(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_method_downloadcallback_progress(`ptr`: Pointer,`progress`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
-
-    fun uniffi_iroh_fn_method_entry_author(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_clone_downloadpolicy(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Pointer
-
-    fun uniffi_iroh_fn_method_entry_content_bytes(
-        `ptr`: Pointer,
-        `doc`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_free_downloadpolicy(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    fun uniffi_iroh_fn_constructor_downloadpolicy_everything(uniffi_out_err: UniffiRustCallStatus, 
+    ): Pointer
+    fun uniffi_iroh_fn_constructor_downloadpolicy_everything_except(`filters`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Pointer
+    fun uniffi_iroh_fn_constructor_downloadpolicy_nothing(uniffi_out_err: UniffiRustCallStatus, 
+    ): Pointer
+    fun uniffi_iroh_fn_constructor_downloadpolicy_nothing_except(`filters`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Pointer
+    fun uniffi_iroh_fn_clone_downloadprogress(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): Pointer
+    fun uniffi_iroh_fn_free_downloadprogress(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    fun uniffi_iroh_fn_method_downloadprogress_as_abort(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
-
-    fun uniffi_iroh_fn_method_entry_content_hash(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_method_downloadprogress_as_all_done(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    fun uniffi_iroh_fn_method_downloadprogress_as_done(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    fun uniffi_iroh_fn_method_downloadprogress_as_found(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    fun uniffi_iroh_fn_method_downloadprogress_as_found_hash_seq(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    fun uniffi_iroh_fn_method_downloadprogress_as_found_local(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    fun uniffi_iroh_fn_method_downloadprogress_as_progress(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    fun uniffi_iroh_fn_method_downloadprogress_type(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    fun uniffi_iroh_fn_clone_entry(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Pointer
-
-    fun uniffi_iroh_fn_method_entry_content_len(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_free_entry(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    fun uniffi_iroh_fn_method_entry_author(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): Pointer
+    fun uniffi_iroh_fn_method_entry_content_bytes(`ptr`: Pointer,`doc`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    fun uniffi_iroh_fn_method_entry_content_hash(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): Pointer
+    fun uniffi_iroh_fn_method_entry_content_len(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Long
-
-    fun uniffi_iroh_fn_method_entry_key(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_method_entry_key(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
-
-    fun uniffi_iroh_fn_method_entry_namespace(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_method_entry_namespace(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
-
-    fun uniffi_iroh_fn_method_entry_timestamp(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_method_entry_timestamp(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Long
-
-    fun uniffi_iroh_fn_clone_filterkind(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_clone_filterkind(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Pointer
-
-    fun uniffi_iroh_fn_free_filterkind(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_free_filterkind(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
-
-    fun uniffi_iroh_fn_constructor_filterkind_exact(
-        `key`: RustBuffer.ByValue,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_constructor_filterkind_exact(`key`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Pointer
-
-    fun uniffi_iroh_fn_constructor_filterkind_prefix(
-        `prefix`: RustBuffer.ByValue,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_constructor_filterkind_prefix(`prefix`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Pointer
-
-    fun uniffi_iroh_fn_method_filterkind_matches(
-        `ptr`: Pointer,
-        `key`: RustBuffer.ByValue,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_method_filterkind_matches(`ptr`: Pointer,`key`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Byte
-
-    fun uniffi_iroh_fn_clone_hash(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_clone_hash(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Pointer
-
-    fun uniffi_iroh_fn_free_hash(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_free_hash(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
-
-    fun uniffi_iroh_fn_constructor_hash_from_bytes(
-        `bytes`: RustBuffer.ByValue,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_constructor_hash_from_bytes(`bytes`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Pointer
-
-    fun uniffi_iroh_fn_constructor_hash_from_string(
-        `s`: RustBuffer.ByValue,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_constructor_hash_from_string(`s`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Pointer
-
-    fun uniffi_iroh_fn_constructor_hash_new(
-        `buf`: RustBuffer.ByValue,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_constructor_hash_new(`buf`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Pointer
-
-    fun uniffi_iroh_fn_method_hash_equal(
-        `ptr`: Pointer,
-        `other`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_method_hash_equal(`ptr`: Pointer,`other`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Byte
-
-    fun uniffi_iroh_fn_method_hash_to_bytes(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_method_hash_to_bytes(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
-
-    fun uniffi_iroh_fn_method_hash_to_hex(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_method_hash_to_hex(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
-
-    fun uniffi_iroh_fn_method_hash_uniffi_trait_display(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_method_hash_uniffi_trait_display(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
-
-    fun uniffi_iroh_fn_clone_iroherror(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_clone_iroherror(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Pointer
-
-    fun uniffi_iroh_fn_free_iroherror(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_free_iroherror(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
-
-    fun uniffi_iroh_fn_method_iroherror_message(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_method_iroherror_message(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
-
-    fun uniffi_iroh_fn_method_iroherror_uniffi_trait_debug(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_method_iroherror_uniffi_trait_debug(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
-
-    fun uniffi_iroh_fn_clone_irohnode(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_clone_irohnode(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Pointer
-
-    fun uniffi_iroh_fn_free_irohnode(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_free_irohnode(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
-
-    fun uniffi_iroh_fn_constructor_irohnode_new(
-        `path`: RustBuffer.ByValue,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Pointer
-
-    fun uniffi_iroh_fn_constructor_irohnode_with_options(
-        `path`: RustBuffer.ByValue,
-        `opts`: RustBuffer.ByValue,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Pointer
-
-    fun uniffi_iroh_fn_method_irohnode_author_create(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Pointer
-
-    fun uniffi_iroh_fn_method_irohnode_author_default(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Pointer
-
-    fun uniffi_iroh_fn_method_irohnode_author_delete(
-        `ptr`: Pointer,
-        `author`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Unit
-
-    fun uniffi_iroh_fn_method_irohnode_author_export(
-        `ptr`: Pointer,
-        `author`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Pointer
-
-    fun uniffi_iroh_fn_method_irohnode_author_import(
-        `ptr`: Pointer,
-        `author`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Pointer
-
-    fun uniffi_iroh_fn_method_irohnode_author_list(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): RustBuffer.ByValue
-
-    fun uniffi_iroh_fn_method_irohnode_blobs_add_bytes(
-        `ptr`: Pointer,
-        `bytes`: RustBuffer.ByValue,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): RustBuffer.ByValue
-
-    fun uniffi_iroh_fn_method_irohnode_blobs_add_from_path(
-        `ptr`: Pointer,
-        `path`: RustBuffer.ByValue,
-        `inPlace`: Byte,
-        `tag`: Pointer,
-        `wrap`: Pointer,
-        `cb`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Unit
-
-    fun uniffi_iroh_fn_method_irohnode_blobs_create_collection(
-        `ptr`: Pointer,
-        `collection`: Pointer,
-        `tag`: Pointer,
-        `tagsToDelete`: RustBuffer.ByValue,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): RustBuffer.ByValue
-
-    fun uniffi_iroh_fn_method_irohnode_blobs_delete_blob(
-        `ptr`: Pointer,
-        `hash`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Unit
-
-    fun uniffi_iroh_fn_method_irohnode_blobs_download(
-        `ptr`: Pointer,
-        `hash`: Pointer,
-        `req`: Pointer,
-        `cb`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Unit
-
-    fun uniffi_iroh_fn_method_irohnode_blobs_export(
-        `ptr`: Pointer,
-        `hash`: Pointer,
-        `destination`: RustBuffer.ByValue,
-        `format`: RustBuffer.ByValue,
-        `mode`: RustBuffer.ByValue,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Unit
-
-    fun uniffi_iroh_fn_method_irohnode_blobs_get_collection(
-        `ptr`: Pointer,
-        `hash`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Pointer
-
-    fun uniffi_iroh_fn_method_irohnode_blobs_list(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): RustBuffer.ByValue
-
-    fun uniffi_iroh_fn_method_irohnode_blobs_list_collections(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): RustBuffer.ByValue
-
-    fun uniffi_iroh_fn_method_irohnode_blobs_list_incomplete(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): RustBuffer.ByValue
-
-    fun uniffi_iroh_fn_method_irohnode_blobs_read_at_to_bytes(
-        `ptr`: Pointer,
-        `hash`: Pointer,
-        `offset`: Long,
-        `len`: RustBuffer.ByValue,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): RustBuffer.ByValue
-
-    fun uniffi_iroh_fn_method_irohnode_blobs_read_to_bytes(
-        `ptr`: Pointer,
-        `hash`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): RustBuffer.ByValue
-
-    fun uniffi_iroh_fn_method_irohnode_blobs_share(
-        `ptr`: Pointer,
-        `hash`: Pointer,
-        `blobFormat`: RustBuffer.ByValue,
-        `ticketOptions`: RustBuffer.ByValue,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): RustBuffer.ByValue
-
-    fun uniffi_iroh_fn_method_irohnode_blobs_size(
-        `ptr`: Pointer,
-        `hash`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_constructor_irohnode_new(`path`: RustBuffer.ByValue,
     ): Long
-
-    fun uniffi_iroh_fn_method_irohnode_blobs_write_to_path(
-        `ptr`: Pointer,
-        `hash`: Pointer,
-        `path`: RustBuffer.ByValue,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Unit
-
-    fun uniffi_iroh_fn_method_irohnode_connection_info(
-        `ptr`: Pointer,
-        `nodeId`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): RustBuffer.ByValue
-
-    fun uniffi_iroh_fn_method_irohnode_connections(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): RustBuffer.ByValue
-
-    fun uniffi_iroh_fn_method_irohnode_doc_create(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Pointer
-
-    fun uniffi_iroh_fn_method_irohnode_doc_drop(
-        `ptr`: Pointer,
-        `docId`: RustBuffer.ByValue,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Unit
-
-    fun uniffi_iroh_fn_method_irohnode_doc_join(
-        `ptr`: Pointer,
-        `ticket`: RustBuffer.ByValue,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Pointer
-
-    fun uniffi_iroh_fn_method_irohnode_doc_join_and_subscribe(
-        `ptr`: Pointer,
-        `ticket`: RustBuffer.ByValue,
-        `cb`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Pointer
-
-    fun uniffi_iroh_fn_method_irohnode_doc_list(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): RustBuffer.ByValue
-
-    fun uniffi_iroh_fn_method_irohnode_doc_open(
-        `ptr`: Pointer,
-        `id`: RustBuffer.ByValue,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): RustBuffer.ByValue
-
-    fun uniffi_iroh_fn_method_irohnode_node_id(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): RustBuffer.ByValue
-
-    fun uniffi_iroh_fn_method_irohnode_stats(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): RustBuffer.ByValue
-
-    fun uniffi_iroh_fn_method_irohnode_status(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Pointer
-
-    fun uniffi_iroh_fn_method_irohnode_tags_delete(
-        `ptr`: Pointer,
-        `name`: RustBuffer.ByValue,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Unit
-
-    fun uniffi_iroh_fn_method_irohnode_tags_list(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): RustBuffer.ByValue
-
-    fun uniffi_iroh_fn_clone_liveevent(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Pointer
-
-    fun uniffi_iroh_fn_free_liveevent(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Unit
-
-    fun uniffi_iroh_fn_method_liveevent_as_content_ready(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Pointer
-
-    fun uniffi_iroh_fn_method_liveevent_as_insert_local(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Pointer
-
-    fun uniffi_iroh_fn_method_liveevent_as_insert_remote(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): RustBuffer.ByValue
-
-    fun uniffi_iroh_fn_method_liveevent_as_neighbor_down(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Pointer
-
-    fun uniffi_iroh_fn_method_liveevent_as_neighbor_up(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Pointer
-
-    fun uniffi_iroh_fn_method_liveevent_as_sync_finished(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): RustBuffer.ByValue
-
-    fun uniffi_iroh_fn_method_liveevent_type(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): RustBuffer.ByValue
-
-    fun uniffi_iroh_fn_clone_nodeaddr(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Pointer
-
-    fun uniffi_iroh_fn_free_nodeaddr(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Unit
-
-    fun uniffi_iroh_fn_constructor_nodeaddr_new(
-        `nodeId`: Pointer,
-        `relayUrl`: RustBuffer.ByValue,
-        `addresses`: RustBuffer.ByValue,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Pointer
-
-    fun uniffi_iroh_fn_method_nodeaddr_direct_addresses(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): RustBuffer.ByValue
-
-    fun uniffi_iroh_fn_method_nodeaddr_equal(
-        `ptr`: Pointer,
-        `other`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Byte
-
-    fun uniffi_iroh_fn_method_nodeaddr_relay_url(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): RustBuffer.ByValue
-
-    fun uniffi_iroh_fn_clone_nodestatus(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Pointer
-
-    fun uniffi_iroh_fn_free_nodestatus(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Unit
-
-    fun uniffi_iroh_fn_method_nodestatus_listen_addrs(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): RustBuffer.ByValue
-
-    fun uniffi_iroh_fn_method_nodestatus_node_addr(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Pointer
-
-    fun uniffi_iroh_fn_method_nodestatus_version(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): RustBuffer.ByValue
-
-    fun uniffi_iroh_fn_clone_publickey(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Pointer
-
-    fun uniffi_iroh_fn_free_publickey(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Unit
-
-    fun uniffi_iroh_fn_constructor_publickey_from_bytes(
-        `bytes`: RustBuffer.ByValue,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Pointer
-
-    fun uniffi_iroh_fn_constructor_publickey_from_string(
-        `s`: RustBuffer.ByValue,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Pointer
-
-    fun uniffi_iroh_fn_method_publickey_equal(
-        `ptr`: Pointer,
-        `other`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Byte
-
-    fun uniffi_iroh_fn_method_publickey_fmt_short(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): RustBuffer.ByValue
-
-    fun uniffi_iroh_fn_method_publickey_to_bytes(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): RustBuffer.ByValue
-
-    fun uniffi_iroh_fn_method_publickey_uniffi_trait_display(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): RustBuffer.ByValue
-
-    fun uniffi_iroh_fn_clone_query(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Pointer
-
-    fun uniffi_iroh_fn_free_query(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Unit
-
-    fun uniffi_iroh_fn_constructor_query_all(
-        `opts`: RustBuffer.ByValue,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Pointer
-
-    fun uniffi_iroh_fn_constructor_query_author(
-        `author`: Pointer,
-        `opts`: RustBuffer.ByValue,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Pointer
-
-    fun uniffi_iroh_fn_constructor_query_author_key_exact(
-        `author`: Pointer,
-        `key`: RustBuffer.ByValue,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Pointer
-
-    fun uniffi_iroh_fn_constructor_query_author_key_prefix(
-        `author`: Pointer,
-        `prefix`: RustBuffer.ByValue,
-        `opts`: RustBuffer.ByValue,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Pointer
-
-    fun uniffi_iroh_fn_constructor_query_key_exact(
-        `key`: RustBuffer.ByValue,
-        `opts`: RustBuffer.ByValue,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Pointer
-
-    fun uniffi_iroh_fn_constructor_query_key_prefix(
-        `prefix`: RustBuffer.ByValue,
-        `opts`: RustBuffer.ByValue,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Pointer
-
-    fun uniffi_iroh_fn_constructor_query_single_latest_per_key(
-        `opts`: RustBuffer.ByValue,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Pointer
-
-    fun uniffi_iroh_fn_constructor_query_single_latest_per_key_exact(
-        `exact`: RustBuffer.ByValue,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Pointer
-
-    fun uniffi_iroh_fn_constructor_query_single_latest_per_key_prefix(
-        `prefix`: RustBuffer.ByValue,
-        `opts`: RustBuffer.ByValue,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Pointer
-
-    fun uniffi_iroh_fn_method_query_limit(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): RustBuffer.ByValue
-
-    fun uniffi_iroh_fn_method_query_offset(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_constructor_irohnode_with_options(`path`: RustBuffer.ByValue,`opts`: RustBuffer.ByValue,
     ): Long
-
-    fun uniffi_iroh_fn_clone_rangespec(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_method_irohnode_author_create(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Pointer
-
-    fun uniffi_iroh_fn_free_rangespec(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_method_irohnode_author_default(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): Pointer
+    fun uniffi_iroh_fn_method_irohnode_author_delete(`ptr`: Pointer,`author`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
-
-    fun uniffi_iroh_fn_method_rangespec_is_all(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_method_irohnode_author_export(`ptr`: Pointer,`author`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): Pointer
+    fun uniffi_iroh_fn_method_irohnode_author_import(`ptr`: Pointer,`author`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): Pointer
+    fun uniffi_iroh_fn_method_irohnode_author_list(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    fun uniffi_iroh_fn_method_irohnode_blobs_add_bytes(`ptr`: Pointer,`bytes`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    fun uniffi_iroh_fn_method_irohnode_blobs_add_from_path(`ptr`: Pointer,`path`: RustBuffer.ByValue,`inPlace`: Byte,`tag`: Pointer,`wrap`: Pointer,`cb`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    fun uniffi_iroh_fn_method_irohnode_blobs_create_collection(`ptr`: Pointer,`collection`: Pointer,`tag`: Pointer,`tagsToDelete`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    fun uniffi_iroh_fn_method_irohnode_blobs_delete_blob(`ptr`: Pointer,`hash`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    fun uniffi_iroh_fn_method_irohnode_blobs_download(`ptr`: Pointer,`hash`: Pointer,`req`: Pointer,`cb`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    fun uniffi_iroh_fn_method_irohnode_blobs_export(`ptr`: Pointer,`hash`: Pointer,`destination`: RustBuffer.ByValue,`format`: RustBuffer.ByValue,`mode`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    fun uniffi_iroh_fn_method_irohnode_blobs_get_collection(`ptr`: Pointer,`hash`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): Pointer
+    fun uniffi_iroh_fn_method_irohnode_blobs_list(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    fun uniffi_iroh_fn_method_irohnode_blobs_list_collections(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    fun uniffi_iroh_fn_method_irohnode_blobs_list_incomplete(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    fun uniffi_iroh_fn_method_irohnode_blobs_read_at_to_bytes(`ptr`: Pointer,`hash`: Pointer,`offset`: Long,`len`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    fun uniffi_iroh_fn_method_irohnode_blobs_read_to_bytes(`ptr`: Pointer,`hash`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    fun uniffi_iroh_fn_method_irohnode_blobs_share(`ptr`: Pointer,`hash`: Pointer,`blobFormat`: RustBuffer.ByValue,`ticketOptions`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    fun uniffi_iroh_fn_method_irohnode_blobs_size(`ptr`: Pointer,`hash`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): Long
+    fun uniffi_iroh_fn_method_irohnode_blobs_write_to_path(`ptr`: Pointer,`hash`: Pointer,`path`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    fun uniffi_iroh_fn_method_irohnode_connection_info(`ptr`: Pointer,`nodeId`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    fun uniffi_iroh_fn_method_irohnode_connections(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    fun uniffi_iroh_fn_method_irohnode_doc_create(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): Pointer
+    fun uniffi_iroh_fn_method_irohnode_doc_drop(`ptr`: Pointer,`docId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    fun uniffi_iroh_fn_method_irohnode_doc_join(`ptr`: Pointer,`ticket`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Pointer
+    fun uniffi_iroh_fn_method_irohnode_doc_join_and_subscribe(`ptr`: Pointer,`ticket`: RustBuffer.ByValue,`cb`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): Pointer
+    fun uniffi_iroh_fn_method_irohnode_doc_list(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    fun uniffi_iroh_fn_method_irohnode_doc_open(`ptr`: Pointer,`id`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    fun uniffi_iroh_fn_method_irohnode_node_id(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    fun uniffi_iroh_fn_method_irohnode_stats(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    fun uniffi_iroh_fn_method_irohnode_status(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): Pointer
+    fun uniffi_iroh_fn_method_irohnode_tags_delete(`ptr`: Pointer,`name`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    fun uniffi_iroh_fn_method_irohnode_tags_list(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    fun uniffi_iroh_fn_clone_liveevent(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): Pointer
+    fun uniffi_iroh_fn_free_liveevent(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    fun uniffi_iroh_fn_method_liveevent_as_content_ready(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): Pointer
+    fun uniffi_iroh_fn_method_liveevent_as_insert_local(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): Pointer
+    fun uniffi_iroh_fn_method_liveevent_as_insert_remote(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    fun uniffi_iroh_fn_method_liveevent_as_neighbor_down(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): Pointer
+    fun uniffi_iroh_fn_method_liveevent_as_neighbor_up(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): Pointer
+    fun uniffi_iroh_fn_method_liveevent_as_sync_finished(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    fun uniffi_iroh_fn_method_liveevent_type(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    fun uniffi_iroh_fn_clone_nodeaddr(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): Pointer
+    fun uniffi_iroh_fn_free_nodeaddr(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    fun uniffi_iroh_fn_constructor_nodeaddr_new(`nodeId`: Pointer,`relayUrl`: RustBuffer.ByValue,`addresses`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Pointer
+    fun uniffi_iroh_fn_method_nodeaddr_direct_addresses(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    fun uniffi_iroh_fn_method_nodeaddr_equal(`ptr`: Pointer,`other`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Byte
-
-    fun uniffi_iroh_fn_method_rangespec_is_empty(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_method_nodeaddr_relay_url(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    fun uniffi_iroh_fn_clone_nodestatus(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): Pointer
+    fun uniffi_iroh_fn_free_nodestatus(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    fun uniffi_iroh_fn_method_nodestatus_listen_addrs(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    fun uniffi_iroh_fn_method_nodestatus_node_addr(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): Pointer
+    fun uniffi_iroh_fn_method_nodestatus_version(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    fun uniffi_iroh_fn_clone_publickey(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): Pointer
+    fun uniffi_iroh_fn_free_publickey(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    fun uniffi_iroh_fn_constructor_publickey_from_bytes(`bytes`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Pointer
+    fun uniffi_iroh_fn_constructor_publickey_from_string(`s`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Pointer
+    fun uniffi_iroh_fn_method_publickey_equal(`ptr`: Pointer,`other`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Byte
-
-    fun uniffi_iroh_fn_clone_settagoption(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Pointer
-
-    fun uniffi_iroh_fn_free_settagoption(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Unit
-
-    fun uniffi_iroh_fn_constructor_settagoption_auto(uniffi_out_err: UniffiRustCallStatus): Pointer
-
-    fun uniffi_iroh_fn_constructor_settagoption_named(
-        `tag`: RustBuffer.ByValue,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Pointer
-
-    fun uniffi_iroh_fn_clone_subscribecallback(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Pointer
-
-    fun uniffi_iroh_fn_free_subscribecallback(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Unit
-
-    fun uniffi_iroh_fn_init_callback_vtable_subscribecallback(`vtable`: UniffiVTableCallbackInterfaceSubscribeCallback): Unit
-
-    fun uniffi_iroh_fn_method_subscribecallback_event(
-        `ptr`: Pointer,
-        `event`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Unit
-
-    fun uniffi_iroh_fn_clone_wrapoption(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Pointer
-
-    fun uniffi_iroh_fn_free_wrapoption(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Unit
-
-    fun uniffi_iroh_fn_constructor_wrapoption_no_wrap(uniffi_out_err: UniffiRustCallStatus): Pointer
-
-    fun uniffi_iroh_fn_constructor_wrapoption_wrap(
-        `name`: RustBuffer.ByValue,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Pointer
-
-    fun uniffi_iroh_fn_func_key_to_path(
-        `key`: RustBuffer.ByValue,
-        `prefix`: RustBuffer.ByValue,
-        `root`: RustBuffer.ByValue,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_method_publickey_fmt_short(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
-
-    fun uniffi_iroh_fn_func_path_to_key(
-        `path`: RustBuffer.ByValue,
-        `prefix`: RustBuffer.ByValue,
-        `root`: RustBuffer.ByValue,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_method_publickey_to_bytes(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
-
-    fun uniffi_iroh_fn_func_set_log_level(
-        `level`: RustBuffer.ByValue,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_method_publickey_uniffi_trait_display(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    fun uniffi_iroh_fn_clone_query(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): Pointer
+    fun uniffi_iroh_fn_free_query(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
-
-    fun uniffi_iroh_fn_func_start_metrics_collection(uniffi_out_err: UniffiRustCallStatus): Unit
-
-    fun ffi_iroh_rustbuffer_alloc(
-        `size`: Long,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_constructor_query_all(`opts`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Pointer
+    fun uniffi_iroh_fn_constructor_query_author(`author`: Pointer,`opts`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Pointer
+    fun uniffi_iroh_fn_constructor_query_author_key_exact(`author`: Pointer,`key`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Pointer
+    fun uniffi_iroh_fn_constructor_query_author_key_prefix(`author`: Pointer,`prefix`: RustBuffer.ByValue,`opts`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Pointer
+    fun uniffi_iroh_fn_constructor_query_key_exact(`key`: RustBuffer.ByValue,`opts`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Pointer
+    fun uniffi_iroh_fn_constructor_query_key_prefix(`prefix`: RustBuffer.ByValue,`opts`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Pointer
+    fun uniffi_iroh_fn_constructor_query_single_latest_per_key(`opts`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Pointer
+    fun uniffi_iroh_fn_constructor_query_single_latest_per_key_exact(`exact`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Pointer
+    fun uniffi_iroh_fn_constructor_query_single_latest_per_key_prefix(`prefix`: RustBuffer.ByValue,`opts`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Pointer
+    fun uniffi_iroh_fn_method_query_limit(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
-
-    fun ffi_iroh_rustbuffer_from_bytes(
-        `bytes`: ForeignBytes.ByValue,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): RustBuffer.ByValue
-
-    fun ffi_iroh_rustbuffer_free(
-        `buf`: RustBuffer.ByValue,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_method_query_offset(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): Long
+    fun uniffi_iroh_fn_clone_rangespec(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): Pointer
+    fun uniffi_iroh_fn_free_rangespec(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
-
-    fun ffi_iroh_rustbuffer_reserve(
-        `buf`: RustBuffer.ByValue,
-        `additional`: Long,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): RustBuffer.ByValue
-
-    fun ffi_iroh_rust_future_poll_u8(
-        `handle`: Long,
-        `callback`: UniffiRustFutureContinuationCallback,
-        `callbackData`: Long,
-    ): Unit
-
-    fun ffi_iroh_rust_future_cancel_u8(`handle`: Long): Unit
-
-    fun ffi_iroh_rust_future_free_u8(`handle`: Long): Unit
-
-    fun ffi_iroh_rust_future_complete_u8(
-        `handle`: Long,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_method_rangespec_is_all(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Byte
-
-    fun ffi_iroh_rust_future_poll_i8(
-        `handle`: Long,
-        `callback`: UniffiRustFutureContinuationCallback,
-        `callbackData`: Long,
-    ): Unit
-
-    fun ffi_iroh_rust_future_cancel_i8(`handle`: Long): Unit
-
-    fun ffi_iroh_rust_future_free_i8(`handle`: Long): Unit
-
-    fun ffi_iroh_rust_future_complete_i8(
-        `handle`: Long,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_method_rangespec_is_empty(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Byte
-
-    fun ffi_iroh_rust_future_poll_u16(
-        `handle`: Long,
-        `callback`: UniffiRustFutureContinuationCallback,
-        `callbackData`: Long,
+    fun uniffi_iroh_fn_clone_settagoption(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): Pointer
+    fun uniffi_iroh_fn_free_settagoption(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
-
-    fun ffi_iroh_rust_future_cancel_u16(`handle`: Long): Unit
-
-    fun ffi_iroh_rust_future_free_u16(`handle`: Long): Unit
-
-    fun ffi_iroh_rust_future_complete_u16(
-        `handle`: Long,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_iroh_fn_constructor_settagoption_auto(uniffi_out_err: UniffiRustCallStatus, 
+    ): Pointer
+    fun uniffi_iroh_fn_constructor_settagoption_named(`tag`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Pointer
+    fun uniffi_iroh_fn_clone_subscribecallback(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): Pointer
+    fun uniffi_iroh_fn_free_subscribecallback(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    fun uniffi_iroh_fn_init_callback_vtable_subscribecallback(`vtable`: UniffiVTableCallbackInterfaceSubscribeCallback,
+    ): Unit
+    fun uniffi_iroh_fn_method_subscribecallback_event(`ptr`: Pointer,`event`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    fun uniffi_iroh_fn_clone_wrapoption(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): Pointer
+    fun uniffi_iroh_fn_free_wrapoption(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    fun uniffi_iroh_fn_constructor_wrapoption_no_wrap(uniffi_out_err: UniffiRustCallStatus, 
+    ): Pointer
+    fun uniffi_iroh_fn_constructor_wrapoption_wrap(`name`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Pointer
+    fun uniffi_iroh_fn_func_key_to_path(`key`: RustBuffer.ByValue,`prefix`: RustBuffer.ByValue,`root`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    fun uniffi_iroh_fn_func_path_to_key(`path`: RustBuffer.ByValue,`prefix`: RustBuffer.ByValue,`root`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    fun uniffi_iroh_fn_func_set_log_level(`level`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    fun uniffi_iroh_fn_func_start_metrics_collection(uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    fun ffi_iroh_rustbuffer_alloc(`size`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    fun ffi_iroh_rustbuffer_from_bytes(`bytes`: ForeignBytes.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    fun ffi_iroh_rustbuffer_free(`buf`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    fun ffi_iroh_rustbuffer_reserve(`buf`: RustBuffer.ByValue,`additional`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    fun ffi_iroh_rust_future_poll_u8(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
+    ): Unit
+    fun ffi_iroh_rust_future_cancel_u8(`handle`: Long,
+    ): Unit
+    fun ffi_iroh_rust_future_free_u8(`handle`: Long,
+    ): Unit
+    fun ffi_iroh_rust_future_complete_u8(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): Byte
+    fun ffi_iroh_rust_future_poll_i8(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
+    ): Unit
+    fun ffi_iroh_rust_future_cancel_i8(`handle`: Long,
+    ): Unit
+    fun ffi_iroh_rust_future_free_i8(`handle`: Long,
+    ): Unit
+    fun ffi_iroh_rust_future_complete_i8(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): Byte
+    fun ffi_iroh_rust_future_poll_u16(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
+    ): Unit
+    fun ffi_iroh_rust_future_cancel_u16(`handle`: Long,
+    ): Unit
+    fun ffi_iroh_rust_future_free_u16(`handle`: Long,
+    ): Unit
+    fun ffi_iroh_rust_future_complete_u16(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Short
-
-    fun ffi_iroh_rust_future_poll_i16(
-        `handle`: Long,
-        `callback`: UniffiRustFutureContinuationCallback,
-        `callbackData`: Long,
+    fun ffi_iroh_rust_future_poll_i16(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
     ): Unit
-
-    fun ffi_iroh_rust_future_cancel_i16(`handle`: Long): Unit
-
-    fun ffi_iroh_rust_future_free_i16(`handle`: Long): Unit
-
-    fun ffi_iroh_rust_future_complete_i16(
-        `handle`: Long,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun ffi_iroh_rust_future_cancel_i16(`handle`: Long,
+    ): Unit
+    fun ffi_iroh_rust_future_free_i16(`handle`: Long,
+    ): Unit
+    fun ffi_iroh_rust_future_complete_i16(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Short
-
-    fun ffi_iroh_rust_future_poll_u32(
-        `handle`: Long,
-        `callback`: UniffiRustFutureContinuationCallback,
-        `callbackData`: Long,
+    fun ffi_iroh_rust_future_poll_u32(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
     ): Unit
-
-    fun ffi_iroh_rust_future_cancel_u32(`handle`: Long): Unit
-
-    fun ffi_iroh_rust_future_free_u32(`handle`: Long): Unit
-
-    fun ffi_iroh_rust_future_complete_u32(
-        `handle`: Long,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun ffi_iroh_rust_future_cancel_u32(`handle`: Long,
+    ): Unit
+    fun ffi_iroh_rust_future_free_u32(`handle`: Long,
+    ): Unit
+    fun ffi_iroh_rust_future_complete_u32(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Int
-
-    fun ffi_iroh_rust_future_poll_i32(
-        `handle`: Long,
-        `callback`: UniffiRustFutureContinuationCallback,
-        `callbackData`: Long,
+    fun ffi_iroh_rust_future_poll_i32(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
     ): Unit
-
-    fun ffi_iroh_rust_future_cancel_i32(`handle`: Long): Unit
-
-    fun ffi_iroh_rust_future_free_i32(`handle`: Long): Unit
-
-    fun ffi_iroh_rust_future_complete_i32(
-        `handle`: Long,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun ffi_iroh_rust_future_cancel_i32(`handle`: Long,
+    ): Unit
+    fun ffi_iroh_rust_future_free_i32(`handle`: Long,
+    ): Unit
+    fun ffi_iroh_rust_future_complete_i32(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Int
-
-    fun ffi_iroh_rust_future_poll_u64(
-        `handle`: Long,
-        `callback`: UniffiRustFutureContinuationCallback,
-        `callbackData`: Long,
+    fun ffi_iroh_rust_future_poll_u64(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
     ): Unit
-
-    fun ffi_iroh_rust_future_cancel_u64(`handle`: Long): Unit
-
-    fun ffi_iroh_rust_future_free_u64(`handle`: Long): Unit
-
-    fun ffi_iroh_rust_future_complete_u64(
-        `handle`: Long,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun ffi_iroh_rust_future_cancel_u64(`handle`: Long,
+    ): Unit
+    fun ffi_iroh_rust_future_free_u64(`handle`: Long,
+    ): Unit
+    fun ffi_iroh_rust_future_complete_u64(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Long
-
-    fun ffi_iroh_rust_future_poll_i64(
-        `handle`: Long,
-        `callback`: UniffiRustFutureContinuationCallback,
-        `callbackData`: Long,
+    fun ffi_iroh_rust_future_poll_i64(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
     ): Unit
-
-    fun ffi_iroh_rust_future_cancel_i64(`handle`: Long): Unit
-
-    fun ffi_iroh_rust_future_free_i64(`handle`: Long): Unit
-
-    fun ffi_iroh_rust_future_complete_i64(
-        `handle`: Long,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun ffi_iroh_rust_future_cancel_i64(`handle`: Long,
+    ): Unit
+    fun ffi_iroh_rust_future_free_i64(`handle`: Long,
+    ): Unit
+    fun ffi_iroh_rust_future_complete_i64(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Long
-
-    fun ffi_iroh_rust_future_poll_f32(
-        `handle`: Long,
-        `callback`: UniffiRustFutureContinuationCallback,
-        `callbackData`: Long,
+    fun ffi_iroh_rust_future_poll_f32(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
     ): Unit
-
-    fun ffi_iroh_rust_future_cancel_f32(`handle`: Long): Unit
-
-    fun ffi_iroh_rust_future_free_f32(`handle`: Long): Unit
-
-    fun ffi_iroh_rust_future_complete_f32(
-        `handle`: Long,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun ffi_iroh_rust_future_cancel_f32(`handle`: Long,
+    ): Unit
+    fun ffi_iroh_rust_future_free_f32(`handle`: Long,
+    ): Unit
+    fun ffi_iroh_rust_future_complete_f32(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Float
-
-    fun ffi_iroh_rust_future_poll_f64(
-        `handle`: Long,
-        `callback`: UniffiRustFutureContinuationCallback,
-        `callbackData`: Long,
+    fun ffi_iroh_rust_future_poll_f64(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
     ): Unit
-
-    fun ffi_iroh_rust_future_cancel_f64(`handle`: Long): Unit
-
-    fun ffi_iroh_rust_future_free_f64(`handle`: Long): Unit
-
-    fun ffi_iroh_rust_future_complete_f64(
-        `handle`: Long,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun ffi_iroh_rust_future_cancel_f64(`handle`: Long,
+    ): Unit
+    fun ffi_iroh_rust_future_free_f64(`handle`: Long,
+    ): Unit
+    fun ffi_iroh_rust_future_complete_f64(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Double
-
-    fun ffi_iroh_rust_future_poll_pointer(
-        `handle`: Long,
-        `callback`: UniffiRustFutureContinuationCallback,
-        `callbackData`: Long,
+    fun ffi_iroh_rust_future_poll_pointer(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
     ): Unit
-
-    fun ffi_iroh_rust_future_cancel_pointer(`handle`: Long): Unit
-
-    fun ffi_iroh_rust_future_free_pointer(`handle`: Long): Unit
-
-    fun ffi_iroh_rust_future_complete_pointer(
-        `handle`: Long,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun ffi_iroh_rust_future_cancel_pointer(`handle`: Long,
+    ): Unit
+    fun ffi_iroh_rust_future_free_pointer(`handle`: Long,
+    ): Unit
+    fun ffi_iroh_rust_future_complete_pointer(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Pointer
-
-    fun ffi_iroh_rust_future_poll_rust_buffer(
-        `handle`: Long,
-        `callback`: UniffiRustFutureContinuationCallback,
-        `callbackData`: Long,
+    fun ffi_iroh_rust_future_poll_rust_buffer(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
     ): Unit
-
-    fun ffi_iroh_rust_future_cancel_rust_buffer(`handle`: Long): Unit
-
-    fun ffi_iroh_rust_future_free_rust_buffer(`handle`: Long): Unit
-
-    fun ffi_iroh_rust_future_complete_rust_buffer(
-        `handle`: Long,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun ffi_iroh_rust_future_cancel_rust_buffer(`handle`: Long,
+    ): Unit
+    fun ffi_iroh_rust_future_free_rust_buffer(`handle`: Long,
+    ): Unit
+    fun ffi_iroh_rust_future_complete_rust_buffer(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
-
-    fun ffi_iroh_rust_future_poll_void(
-        `handle`: Long,
-        `callback`: UniffiRustFutureContinuationCallback,
-        `callbackData`: Long,
+    fun ffi_iroh_rust_future_poll_void(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
     ): Unit
-
-    fun ffi_iroh_rust_future_cancel_void(`handle`: Long): Unit
-
-    fun ffi_iroh_rust_future_free_void(`handle`: Long): Unit
-
-    fun ffi_iroh_rust_future_complete_void(
-        `handle`: Long,
-        uniffi_out_err: UniffiRustCallStatus,
+    fun ffi_iroh_rust_future_cancel_void(`handle`: Long,
     ): Unit
-
-    fun uniffi_iroh_checksum_func_key_to_path(): Short
-
-    fun uniffi_iroh_checksum_func_path_to_key(): Short
-
-    fun uniffi_iroh_checksum_func_set_log_level(): Short
-
-    fun uniffi_iroh_checksum_func_start_metrics_collection(): Short
-
-    fun uniffi_iroh_checksum_method_addcallback_progress(): Short
-
-    fun uniffi_iroh_checksum_method_addprogress_as_abort(): Short
-
-    fun uniffi_iroh_checksum_method_addprogress_as_all_done(): Short
-
-    fun uniffi_iroh_checksum_method_addprogress_as_done(): Short
-
-    fun uniffi_iroh_checksum_method_addprogress_as_found(): Short
-
-    fun uniffi_iroh_checksum_method_addprogress_as_progress(): Short
-
-    fun uniffi_iroh_checksum_method_addprogress_type(): Short
-
-    fun uniffi_iroh_checksum_method_author_id(): Short
-
-    fun uniffi_iroh_checksum_method_authorid_equal(): Short
-
-    fun uniffi_iroh_checksum_method_blobticket_as_download_options(): Short
-
-    fun uniffi_iroh_checksum_method_blobticket_format(): Short
-
-    fun uniffi_iroh_checksum_method_blobticket_hash(): Short
-
-    fun uniffi_iroh_checksum_method_blobticket_node_addr(): Short
-
-    fun uniffi_iroh_checksum_method_collection_blobs(): Short
-
-    fun uniffi_iroh_checksum_method_collection_is_empty(): Short
-
-    fun uniffi_iroh_checksum_method_collection_len(): Short
-
-    fun uniffi_iroh_checksum_method_collection_links(): Short
-
-    fun uniffi_iroh_checksum_method_collection_names(): Short
-
-    fun uniffi_iroh_checksum_method_collection_push(): Short
-
-    fun uniffi_iroh_checksum_method_connectiontype_as_direct(): Short
-
-    fun uniffi_iroh_checksum_method_connectiontype_as_mixed(): Short
-
-    fun uniffi_iroh_checksum_method_connectiontype_as_relay(): Short
-
-    fun uniffi_iroh_checksum_method_connectiontype_type(): Short
-
-    fun uniffi_iroh_checksum_method_directaddrinfo_addr(): Short
-
-    fun uniffi_iroh_checksum_method_directaddrinfo_last_control(): Short
-
-    fun uniffi_iroh_checksum_method_directaddrinfo_last_payload(): Short
-
-    fun uniffi_iroh_checksum_method_directaddrinfo_latency(): Short
-
-    fun uniffi_iroh_checksum_method_doc_close_me(): Short
-
-    fun uniffi_iroh_checksum_method_doc_del(): Short
-
-    fun uniffi_iroh_checksum_method_doc_export_file(): Short
-
-    fun uniffi_iroh_checksum_method_doc_get_download_policy(): Short
-
-    fun uniffi_iroh_checksum_method_doc_get_exact(): Short
-
-    fun uniffi_iroh_checksum_method_doc_get_many(): Short
-
-    fun uniffi_iroh_checksum_method_doc_get_one(): Short
-
-    fun uniffi_iroh_checksum_method_doc_id(): Short
-
-    fun uniffi_iroh_checksum_method_doc_import_file(): Short
-
-    fun uniffi_iroh_checksum_method_doc_leave(): Short
-
-    fun uniffi_iroh_checksum_method_doc_set_bytes(): Short
-
-    fun uniffi_iroh_checksum_method_doc_set_download_policy(): Short
-
-    fun uniffi_iroh_checksum_method_doc_set_hash(): Short
-
-    fun uniffi_iroh_checksum_method_doc_share(): Short
-
-    fun uniffi_iroh_checksum_method_doc_start_sync(): Short
-
-    fun uniffi_iroh_checksum_method_doc_status(): Short
-
-    fun uniffi_iroh_checksum_method_doc_subscribe(): Short
-
-    fun uniffi_iroh_checksum_method_docexportfilecallback_progress(): Short
-
-    fun uniffi_iroh_checksum_method_docexportprogress_as_abort(): Short
-
-    fun uniffi_iroh_checksum_method_docexportprogress_as_found(): Short
-
-    fun uniffi_iroh_checksum_method_docexportprogress_as_progress(): Short
-
-    fun uniffi_iroh_checksum_method_docexportprogress_type(): Short
-
-    fun uniffi_iroh_checksum_method_docimportfilecallback_progress(): Short
-
-    fun uniffi_iroh_checksum_method_docimportprogress_as_abort(): Short
-
-    fun uniffi_iroh_checksum_method_docimportprogress_as_all_done(): Short
-
-    fun uniffi_iroh_checksum_method_docimportprogress_as_found(): Short
-
-    fun uniffi_iroh_checksum_method_docimportprogress_as_ingest_done(): Short
-
-    fun uniffi_iroh_checksum_method_docimportprogress_as_progress(): Short
-
-    fun uniffi_iroh_checksum_method_docimportprogress_type(): Short
-
-    fun uniffi_iroh_checksum_method_downloadcallback_progress(): Short
-
-    fun uniffi_iroh_checksum_method_downloadprogress_as_abort(): Short
-
-    fun uniffi_iroh_checksum_method_downloadprogress_as_all_done(): Short
-
-    fun uniffi_iroh_checksum_method_downloadprogress_as_done(): Short
-
-    fun uniffi_iroh_checksum_method_downloadprogress_as_found(): Short
-
-    fun uniffi_iroh_checksum_method_downloadprogress_as_found_hash_seq(): Short
-
-    fun uniffi_iroh_checksum_method_downloadprogress_as_found_local(): Short
-
-    fun uniffi_iroh_checksum_method_downloadprogress_as_progress(): Short
-
-    fun uniffi_iroh_checksum_method_downloadprogress_type(): Short
-
-    fun uniffi_iroh_checksum_method_entry_author(): Short
-
-    fun uniffi_iroh_checksum_method_entry_content_bytes(): Short
-
-    fun uniffi_iroh_checksum_method_entry_content_hash(): Short
-
-    fun uniffi_iroh_checksum_method_entry_content_len(): Short
-
-    fun uniffi_iroh_checksum_method_entry_key(): Short
-
-    fun uniffi_iroh_checksum_method_entry_namespace(): Short
-
-    fun uniffi_iroh_checksum_method_entry_timestamp(): Short
-
-    fun uniffi_iroh_checksum_method_filterkind_matches(): Short
-
-    fun uniffi_iroh_checksum_method_hash_equal(): Short
-
-    fun uniffi_iroh_checksum_method_hash_to_bytes(): Short
-
-    fun uniffi_iroh_checksum_method_hash_to_hex(): Short
-
-    fun uniffi_iroh_checksum_method_iroherror_message(): Short
-
-    fun uniffi_iroh_checksum_method_irohnode_author_create(): Short
-
-    fun uniffi_iroh_checksum_method_irohnode_author_default(): Short
-
-    fun uniffi_iroh_checksum_method_irohnode_author_delete(): Short
-
-    fun uniffi_iroh_checksum_method_irohnode_author_export(): Short
-
-    fun uniffi_iroh_checksum_method_irohnode_author_import(): Short
-
-    fun uniffi_iroh_checksum_method_irohnode_author_list(): Short
-
-    fun uniffi_iroh_checksum_method_irohnode_blobs_add_bytes(): Short
-
-    fun uniffi_iroh_checksum_method_irohnode_blobs_add_from_path(): Short
-
-    fun uniffi_iroh_checksum_method_irohnode_blobs_create_collection(): Short
-
-    fun uniffi_iroh_checksum_method_irohnode_blobs_delete_blob(): Short
-
-    fun uniffi_iroh_checksum_method_irohnode_blobs_download(): Short
-
-    fun uniffi_iroh_checksum_method_irohnode_blobs_export(): Short
-
-    fun uniffi_iroh_checksum_method_irohnode_blobs_get_collection(): Short
-
-    fun uniffi_iroh_checksum_method_irohnode_blobs_list(): Short
-
-    fun uniffi_iroh_checksum_method_irohnode_blobs_list_collections(): Short
-
-    fun uniffi_iroh_checksum_method_irohnode_blobs_list_incomplete(): Short
-
-    fun uniffi_iroh_checksum_method_irohnode_blobs_read_at_to_bytes(): Short
-
-    fun uniffi_iroh_checksum_method_irohnode_blobs_read_to_bytes(): Short
-
-    fun uniffi_iroh_checksum_method_irohnode_blobs_share(): Short
-
-    fun uniffi_iroh_checksum_method_irohnode_blobs_size(): Short
-
-    fun uniffi_iroh_checksum_method_irohnode_blobs_write_to_path(): Short
-
-    fun uniffi_iroh_checksum_method_irohnode_connection_info(): Short
-
-    fun uniffi_iroh_checksum_method_irohnode_connections(): Short
-
-    fun uniffi_iroh_checksum_method_irohnode_doc_create(): Short
-
-    fun uniffi_iroh_checksum_method_irohnode_doc_drop(): Short
-
-    fun uniffi_iroh_checksum_method_irohnode_doc_join(): Short
-
-    fun uniffi_iroh_checksum_method_irohnode_doc_join_and_subscribe(): Short
-
-    fun uniffi_iroh_checksum_method_irohnode_doc_list(): Short
-
-    fun uniffi_iroh_checksum_method_irohnode_doc_open(): Short
-
-    fun uniffi_iroh_checksum_method_irohnode_node_id(): Short
-
-    fun uniffi_iroh_checksum_method_irohnode_stats(): Short
-
-    fun uniffi_iroh_checksum_method_irohnode_status(): Short
-
-    fun uniffi_iroh_checksum_method_irohnode_tags_delete(): Short
-
-    fun uniffi_iroh_checksum_method_irohnode_tags_list(): Short
-
-    fun uniffi_iroh_checksum_method_liveevent_as_content_ready(): Short
-
-    fun uniffi_iroh_checksum_method_liveevent_as_insert_local(): Short
-
-    fun uniffi_iroh_checksum_method_liveevent_as_insert_remote(): Short
-
-    fun uniffi_iroh_checksum_method_liveevent_as_neighbor_down(): Short
-
-    fun uniffi_iroh_checksum_method_liveevent_as_neighbor_up(): Short
-
-    fun uniffi_iroh_checksum_method_liveevent_as_sync_finished(): Short
-
-    fun uniffi_iroh_checksum_method_liveevent_type(): Short
-
-    fun uniffi_iroh_checksum_method_nodeaddr_direct_addresses(): Short
-
-    fun uniffi_iroh_checksum_method_nodeaddr_equal(): Short
-
-    fun uniffi_iroh_checksum_method_nodeaddr_relay_url(): Short
-
-    fun uniffi_iroh_checksum_method_nodestatus_listen_addrs(): Short
-
-    fun uniffi_iroh_checksum_method_nodestatus_node_addr(): Short
-
-    fun uniffi_iroh_checksum_method_nodestatus_version(): Short
-
-    fun uniffi_iroh_checksum_method_publickey_equal(): Short
-
-    fun uniffi_iroh_checksum_method_publickey_fmt_short(): Short
-
-    fun uniffi_iroh_checksum_method_publickey_to_bytes(): Short
-
-    fun uniffi_iroh_checksum_method_query_limit(): Short
-
-    fun uniffi_iroh_checksum_method_query_offset(): Short
-
-    fun uniffi_iroh_checksum_method_rangespec_is_all(): Short
-
-    fun uniffi_iroh_checksum_method_rangespec_is_empty(): Short
-
-    fun uniffi_iroh_checksum_method_subscribecallback_event(): Short
-
-    fun uniffi_iroh_checksum_constructor_author_from_string(): Short
-
-    fun uniffi_iroh_checksum_constructor_authorid_from_string(): Short
-
-    fun uniffi_iroh_checksum_constructor_blobdownloadoptions_new(): Short
-
-    fun uniffi_iroh_checksum_constructor_blobticket_new(): Short
-
-    fun uniffi_iroh_checksum_constructor_collection_new(): Short
-
-    fun uniffi_iroh_checksum_constructor_downloadpolicy_everything(): Short
-
-    fun uniffi_iroh_checksum_constructor_downloadpolicy_everything_except(): Short
-
-    fun uniffi_iroh_checksum_constructor_downloadpolicy_nothing(): Short
-
-    fun uniffi_iroh_checksum_constructor_downloadpolicy_nothing_except(): Short
-
-    fun uniffi_iroh_checksum_constructor_filterkind_exact(): Short
-
-    fun uniffi_iroh_checksum_constructor_filterkind_prefix(): Short
-
-    fun uniffi_iroh_checksum_constructor_hash_from_bytes(): Short
-
-    fun uniffi_iroh_checksum_constructor_hash_from_string(): Short
-
-    fun uniffi_iroh_checksum_constructor_hash_new(): Short
-
-    fun uniffi_iroh_checksum_constructor_irohnode_new(): Short
-
-    fun uniffi_iroh_checksum_constructor_irohnode_with_options(): Short
-
-    fun uniffi_iroh_checksum_constructor_nodeaddr_new(): Short
-
-    fun uniffi_iroh_checksum_constructor_publickey_from_bytes(): Short
-
-    fun uniffi_iroh_checksum_constructor_publickey_from_string(): Short
-
-    fun uniffi_iroh_checksum_constructor_query_all(): Short
-
-    fun uniffi_iroh_checksum_constructor_query_author(): Short
-
-    fun uniffi_iroh_checksum_constructor_query_author_key_exact(): Short
-
-    fun uniffi_iroh_checksum_constructor_query_author_key_prefix(): Short
-
-    fun uniffi_iroh_checksum_constructor_query_key_exact(): Short
-
-    fun uniffi_iroh_checksum_constructor_query_key_prefix(): Short
-
-    fun uniffi_iroh_checksum_constructor_query_single_latest_per_key(): Short
-
-    fun uniffi_iroh_checksum_constructor_query_single_latest_per_key_exact(): Short
-
-    fun uniffi_iroh_checksum_constructor_query_single_latest_per_key_prefix(): Short
-
-    fun uniffi_iroh_checksum_constructor_settagoption_auto(): Short
-
-    fun uniffi_iroh_checksum_constructor_settagoption_named(): Short
-
-    fun uniffi_iroh_checksum_constructor_wrapoption_no_wrap(): Short
-
-    fun uniffi_iroh_checksum_constructor_wrapoption_wrap(): Short
-
-    fun ffi_iroh_uniffi_contract_version(): Int
+    fun ffi_iroh_rust_future_free_void(`handle`: Long,
+    ): Unit
+    fun ffi_iroh_rust_future_complete_void(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    fun uniffi_iroh_checksum_func_key_to_path(
+    ): Short
+    fun uniffi_iroh_checksum_func_path_to_key(
+    ): Short
+    fun uniffi_iroh_checksum_func_set_log_level(
+    ): Short
+    fun uniffi_iroh_checksum_func_start_metrics_collection(
+    ): Short
+    fun uniffi_iroh_checksum_method_addcallback_progress(
+    ): Short
+    fun uniffi_iroh_checksum_method_addprogress_as_abort(
+    ): Short
+    fun uniffi_iroh_checksum_method_addprogress_as_all_done(
+    ): Short
+    fun uniffi_iroh_checksum_method_addprogress_as_done(
+    ): Short
+    fun uniffi_iroh_checksum_method_addprogress_as_found(
+    ): Short
+    fun uniffi_iroh_checksum_method_addprogress_as_progress(
+    ): Short
+    fun uniffi_iroh_checksum_method_addprogress_type(
+    ): Short
+    fun uniffi_iroh_checksum_method_author_id(
+    ): Short
+    fun uniffi_iroh_checksum_method_authorid_equal(
+    ): Short
+    fun uniffi_iroh_checksum_method_blobticket_as_download_options(
+    ): Short
+    fun uniffi_iroh_checksum_method_blobticket_format(
+    ): Short
+    fun uniffi_iroh_checksum_method_blobticket_hash(
+    ): Short
+    fun uniffi_iroh_checksum_method_blobticket_node_addr(
+    ): Short
+    fun uniffi_iroh_checksum_method_collection_blobs(
+    ): Short
+    fun uniffi_iroh_checksum_method_collection_is_empty(
+    ): Short
+    fun uniffi_iroh_checksum_method_collection_len(
+    ): Short
+    fun uniffi_iroh_checksum_method_collection_links(
+    ): Short
+    fun uniffi_iroh_checksum_method_collection_names(
+    ): Short
+    fun uniffi_iroh_checksum_method_collection_push(
+    ): Short
+    fun uniffi_iroh_checksum_method_connectiontype_as_direct(
+    ): Short
+    fun uniffi_iroh_checksum_method_connectiontype_as_mixed(
+    ): Short
+    fun uniffi_iroh_checksum_method_connectiontype_as_relay(
+    ): Short
+    fun uniffi_iroh_checksum_method_connectiontype_type(
+    ): Short
+    fun uniffi_iroh_checksum_method_directaddrinfo_addr(
+    ): Short
+    fun uniffi_iroh_checksum_method_directaddrinfo_last_control(
+    ): Short
+    fun uniffi_iroh_checksum_method_directaddrinfo_last_payload(
+    ): Short
+    fun uniffi_iroh_checksum_method_directaddrinfo_latency(
+    ): Short
+    fun uniffi_iroh_checksum_method_doc_close_me(
+    ): Short
+    fun uniffi_iroh_checksum_method_doc_del(
+    ): Short
+    fun uniffi_iroh_checksum_method_doc_export_file(
+    ): Short
+    fun uniffi_iroh_checksum_method_doc_get_download_policy(
+    ): Short
+    fun uniffi_iroh_checksum_method_doc_get_exact(
+    ): Short
+    fun uniffi_iroh_checksum_method_doc_get_many(
+    ): Short
+    fun uniffi_iroh_checksum_method_doc_get_one(
+    ): Short
+    fun uniffi_iroh_checksum_method_doc_id(
+    ): Short
+    fun uniffi_iroh_checksum_method_doc_import_file(
+    ): Short
+    fun uniffi_iroh_checksum_method_doc_leave(
+    ): Short
+    fun uniffi_iroh_checksum_method_doc_set_bytes(
+    ): Short
+    fun uniffi_iroh_checksum_method_doc_set_download_policy(
+    ): Short
+    fun uniffi_iroh_checksum_method_doc_set_hash(
+    ): Short
+    fun uniffi_iroh_checksum_method_doc_share(
+    ): Short
+    fun uniffi_iroh_checksum_method_doc_start_sync(
+    ): Short
+    fun uniffi_iroh_checksum_method_doc_status(
+    ): Short
+    fun uniffi_iroh_checksum_method_doc_subscribe(
+    ): Short
+    fun uniffi_iroh_checksum_method_docexportfilecallback_progress(
+    ): Short
+    fun uniffi_iroh_checksum_method_docexportprogress_as_abort(
+    ): Short
+    fun uniffi_iroh_checksum_method_docexportprogress_as_found(
+    ): Short
+    fun uniffi_iroh_checksum_method_docexportprogress_as_progress(
+    ): Short
+    fun uniffi_iroh_checksum_method_docexportprogress_type(
+    ): Short
+    fun uniffi_iroh_checksum_method_docimportfilecallback_progress(
+    ): Short
+    fun uniffi_iroh_checksum_method_docimportprogress_as_abort(
+    ): Short
+    fun uniffi_iroh_checksum_method_docimportprogress_as_all_done(
+    ): Short
+    fun uniffi_iroh_checksum_method_docimportprogress_as_found(
+    ): Short
+    fun uniffi_iroh_checksum_method_docimportprogress_as_ingest_done(
+    ): Short
+    fun uniffi_iroh_checksum_method_docimportprogress_as_progress(
+    ): Short
+    fun uniffi_iroh_checksum_method_docimportprogress_type(
+    ): Short
+    fun uniffi_iroh_checksum_method_downloadcallback_progress(
+    ): Short
+    fun uniffi_iroh_checksum_method_downloadprogress_as_abort(
+    ): Short
+    fun uniffi_iroh_checksum_method_downloadprogress_as_all_done(
+    ): Short
+    fun uniffi_iroh_checksum_method_downloadprogress_as_done(
+    ): Short
+    fun uniffi_iroh_checksum_method_downloadprogress_as_found(
+    ): Short
+    fun uniffi_iroh_checksum_method_downloadprogress_as_found_hash_seq(
+    ): Short
+    fun uniffi_iroh_checksum_method_downloadprogress_as_found_local(
+    ): Short
+    fun uniffi_iroh_checksum_method_downloadprogress_as_progress(
+    ): Short
+    fun uniffi_iroh_checksum_method_downloadprogress_type(
+    ): Short
+    fun uniffi_iroh_checksum_method_entry_author(
+    ): Short
+    fun uniffi_iroh_checksum_method_entry_content_bytes(
+    ): Short
+    fun uniffi_iroh_checksum_method_entry_content_hash(
+    ): Short
+    fun uniffi_iroh_checksum_method_entry_content_len(
+    ): Short
+    fun uniffi_iroh_checksum_method_entry_key(
+    ): Short
+    fun uniffi_iroh_checksum_method_entry_namespace(
+    ): Short
+    fun uniffi_iroh_checksum_method_entry_timestamp(
+    ): Short
+    fun uniffi_iroh_checksum_method_filterkind_matches(
+    ): Short
+    fun uniffi_iroh_checksum_method_hash_equal(
+    ): Short
+    fun uniffi_iroh_checksum_method_hash_to_bytes(
+    ): Short
+    fun uniffi_iroh_checksum_method_hash_to_hex(
+    ): Short
+    fun uniffi_iroh_checksum_method_iroherror_message(
+    ): Short
+    fun uniffi_iroh_checksum_method_irohnode_author_create(
+    ): Short
+    fun uniffi_iroh_checksum_method_irohnode_author_default(
+    ): Short
+    fun uniffi_iroh_checksum_method_irohnode_author_delete(
+    ): Short
+    fun uniffi_iroh_checksum_method_irohnode_author_export(
+    ): Short
+    fun uniffi_iroh_checksum_method_irohnode_author_import(
+    ): Short
+    fun uniffi_iroh_checksum_method_irohnode_author_list(
+    ): Short
+    fun uniffi_iroh_checksum_method_irohnode_blobs_add_bytes(
+    ): Short
+    fun uniffi_iroh_checksum_method_irohnode_blobs_add_from_path(
+    ): Short
+    fun uniffi_iroh_checksum_method_irohnode_blobs_create_collection(
+    ): Short
+    fun uniffi_iroh_checksum_method_irohnode_blobs_delete_blob(
+    ): Short
+    fun uniffi_iroh_checksum_method_irohnode_blobs_download(
+    ): Short
+    fun uniffi_iroh_checksum_method_irohnode_blobs_export(
+    ): Short
+    fun uniffi_iroh_checksum_method_irohnode_blobs_get_collection(
+    ): Short
+    fun uniffi_iroh_checksum_method_irohnode_blobs_list(
+    ): Short
+    fun uniffi_iroh_checksum_method_irohnode_blobs_list_collections(
+    ): Short
+    fun uniffi_iroh_checksum_method_irohnode_blobs_list_incomplete(
+    ): Short
+    fun uniffi_iroh_checksum_method_irohnode_blobs_read_at_to_bytes(
+    ): Short
+    fun uniffi_iroh_checksum_method_irohnode_blobs_read_to_bytes(
+    ): Short
+    fun uniffi_iroh_checksum_method_irohnode_blobs_share(
+    ): Short
+    fun uniffi_iroh_checksum_method_irohnode_blobs_size(
+    ): Short
+    fun uniffi_iroh_checksum_method_irohnode_blobs_write_to_path(
+    ): Short
+    fun uniffi_iroh_checksum_method_irohnode_connection_info(
+    ): Short
+    fun uniffi_iroh_checksum_method_irohnode_connections(
+    ): Short
+    fun uniffi_iroh_checksum_method_irohnode_doc_create(
+    ): Short
+    fun uniffi_iroh_checksum_method_irohnode_doc_drop(
+    ): Short
+    fun uniffi_iroh_checksum_method_irohnode_doc_join(
+    ): Short
+    fun uniffi_iroh_checksum_method_irohnode_doc_join_and_subscribe(
+    ): Short
+    fun uniffi_iroh_checksum_method_irohnode_doc_list(
+    ): Short
+    fun uniffi_iroh_checksum_method_irohnode_doc_open(
+    ): Short
+    fun uniffi_iroh_checksum_method_irohnode_node_id(
+    ): Short
+    fun uniffi_iroh_checksum_method_irohnode_stats(
+    ): Short
+    fun uniffi_iroh_checksum_method_irohnode_status(
+    ): Short
+    fun uniffi_iroh_checksum_method_irohnode_tags_delete(
+    ): Short
+    fun uniffi_iroh_checksum_method_irohnode_tags_list(
+    ): Short
+    fun uniffi_iroh_checksum_method_liveevent_as_content_ready(
+    ): Short
+    fun uniffi_iroh_checksum_method_liveevent_as_insert_local(
+    ): Short
+    fun uniffi_iroh_checksum_method_liveevent_as_insert_remote(
+    ): Short
+    fun uniffi_iroh_checksum_method_liveevent_as_neighbor_down(
+    ): Short
+    fun uniffi_iroh_checksum_method_liveevent_as_neighbor_up(
+    ): Short
+    fun uniffi_iroh_checksum_method_liveevent_as_sync_finished(
+    ): Short
+    fun uniffi_iroh_checksum_method_liveevent_type(
+    ): Short
+    fun uniffi_iroh_checksum_method_nodeaddr_direct_addresses(
+    ): Short
+    fun uniffi_iroh_checksum_method_nodeaddr_equal(
+    ): Short
+    fun uniffi_iroh_checksum_method_nodeaddr_relay_url(
+    ): Short
+    fun uniffi_iroh_checksum_method_nodestatus_listen_addrs(
+    ): Short
+    fun uniffi_iroh_checksum_method_nodestatus_node_addr(
+    ): Short
+    fun uniffi_iroh_checksum_method_nodestatus_version(
+    ): Short
+    fun uniffi_iroh_checksum_method_publickey_equal(
+    ): Short
+    fun uniffi_iroh_checksum_method_publickey_fmt_short(
+    ): Short
+    fun uniffi_iroh_checksum_method_publickey_to_bytes(
+    ): Short
+    fun uniffi_iroh_checksum_method_query_limit(
+    ): Short
+    fun uniffi_iroh_checksum_method_query_offset(
+    ): Short
+    fun uniffi_iroh_checksum_method_rangespec_is_all(
+    ): Short
+    fun uniffi_iroh_checksum_method_rangespec_is_empty(
+    ): Short
+    fun uniffi_iroh_checksum_method_subscribecallback_event(
+    ): Short
+    fun uniffi_iroh_checksum_constructor_author_from_string(
+    ): Short
+    fun uniffi_iroh_checksum_constructor_authorid_from_string(
+    ): Short
+    fun uniffi_iroh_checksum_constructor_blobdownloadoptions_new(
+    ): Short
+    fun uniffi_iroh_checksum_constructor_blobticket_new(
+    ): Short
+    fun uniffi_iroh_checksum_constructor_collection_new(
+    ): Short
+    fun uniffi_iroh_checksum_constructor_downloadpolicy_everything(
+    ): Short
+    fun uniffi_iroh_checksum_constructor_downloadpolicy_everything_except(
+    ): Short
+    fun uniffi_iroh_checksum_constructor_downloadpolicy_nothing(
+    ): Short
+    fun uniffi_iroh_checksum_constructor_downloadpolicy_nothing_except(
+    ): Short
+    fun uniffi_iroh_checksum_constructor_filterkind_exact(
+    ): Short
+    fun uniffi_iroh_checksum_constructor_filterkind_prefix(
+    ): Short
+    fun uniffi_iroh_checksum_constructor_hash_from_bytes(
+    ): Short
+    fun uniffi_iroh_checksum_constructor_hash_from_string(
+    ): Short
+    fun uniffi_iroh_checksum_constructor_hash_new(
+    ): Short
+    fun uniffi_iroh_checksum_constructor_irohnode_new(
+    ): Short
+    fun uniffi_iroh_checksum_constructor_irohnode_with_options(
+    ): Short
+    fun uniffi_iroh_checksum_constructor_nodeaddr_new(
+    ): Short
+    fun uniffi_iroh_checksum_constructor_publickey_from_bytes(
+    ): Short
+    fun uniffi_iroh_checksum_constructor_publickey_from_string(
+    ): Short
+    fun uniffi_iroh_checksum_constructor_query_all(
+    ): Short
+    fun uniffi_iroh_checksum_constructor_query_author(
+    ): Short
+    fun uniffi_iroh_checksum_constructor_query_author_key_exact(
+    ): Short
+    fun uniffi_iroh_checksum_constructor_query_author_key_prefix(
+    ): Short
+    fun uniffi_iroh_checksum_constructor_query_key_exact(
+    ): Short
+    fun uniffi_iroh_checksum_constructor_query_key_prefix(
+    ): Short
+    fun uniffi_iroh_checksum_constructor_query_single_latest_per_key(
+    ): Short
+    fun uniffi_iroh_checksum_constructor_query_single_latest_per_key_exact(
+    ): Short
+    fun uniffi_iroh_checksum_constructor_query_single_latest_per_key_prefix(
+    ): Short
+    fun uniffi_iroh_checksum_constructor_settagoption_auto(
+    ): Short
+    fun uniffi_iroh_checksum_constructor_settagoption_named(
+    ): Short
+    fun uniffi_iroh_checksum_constructor_wrapoption_no_wrap(
+    ): Short
+    fun uniffi_iroh_checksum_constructor_wrapoption_wrap(
+    ): Short
+    fun ffi_iroh_uniffi_contract_version(
+    ): Int
+    
 }
 
 private fun uniffiCheckContractApiVersion(lib: UniffiLib) {
@@ -3161,10 +2620,10 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
     if (lib.uniffi_iroh_checksum_constructor_hash_new() != 25525.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_iroh_checksum_constructor_irohnode_new() != 55095.toShort()) {
+    if (lib.uniffi_iroh_checksum_constructor_irohnode_new() != 6430.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_iroh_checksum_constructor_irohnode_with_options() != 31863.toShort()) {
+    if (lib.uniffi_iroh_checksum_constructor_irohnode_with_options() != 15317.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_iroh_checksum_constructor_nodeaddr_new() != 31240.toShort()) {
@@ -3218,8 +2677,49 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
 }
 
 // Async support
+// Async return type handlers
+
+internal const val UNIFFI_RUST_FUTURE_POLL_READY = 0.toByte()
+internal const val UNIFFI_RUST_FUTURE_POLL_MAYBE_READY = 1.toByte()
+
+internal val uniffiContinuationHandleMap = UniffiHandleMap<CancellableContinuation<Byte>>()
+
+// FFI type for Rust future continuations
+internal object uniffiRustFutureContinuationCallbackImpl: UniffiRustFutureContinuationCallback {
+    override fun callback(data: Long, pollResult: Byte) {
+        uniffiContinuationHandleMap.remove(data).resume(pollResult)
+    }
+}
+
+internal suspend fun<T, F, E: kotlin.Exception> uniffiRustCallAsync(
+    rustFuture: Long,
+    pollFunc: (Long, UniffiRustFutureContinuationCallback, Long) -> Unit,
+    completeFunc: (Long, UniffiRustCallStatus) -> F,
+    freeFunc: (Long) -> Unit,
+    liftFunc: (F) -> T,
+    errorHandler: UniffiRustCallStatusErrorHandler<E>
+): T {
+    try {
+        do {
+            val pollResult = suspendCancellableCoroutine<Byte> { continuation ->
+                pollFunc(
+                    rustFuture,
+                    uniffiRustFutureContinuationCallbackImpl,
+                    uniffiContinuationHandleMap.insert(continuation)
+                )
+            }
+        } while (pollResult != UNIFFI_RUST_FUTURE_POLL_READY);
+
+        return liftFunc(
+            uniffiRustCallWithError(errorHandler, { status -> completeFunc(rustFuture, status) })
+        )
+    } finally {
+        freeFunc(rustFuture)
+    }
+}
 
 // Public interface members begin here.
+
 
 // Interface implemented by anything that can contain an object reference.
 //
@@ -3231,11 +2731,9 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
 // helper method to execute a block and destroy the object at the end.
 interface Disposable {
     fun destroy()
-
     companion object {
         fun destroy(vararg args: Any?) {
-            args
-                .filterIsInstance<Disposable>()
+            args.filterIsInstance<Disposable>()
                 .forEach(Disposable::destroy)
         }
     }
@@ -3256,58 +2754,67 @@ inline fun <T : Disposable?, R> T.use(block: (T) -> R) =
 /** Used to instantiate an interface without an actual pointer, for fakes in tests, mostly. */
 object NoPointer
 
-public object FfiConverterUInt : FfiConverter<UInt, Int> {
-    override fun lift(value: Int): UInt = value.toUInt()
+public object FfiConverterUInt: FfiConverter<UInt, Int> {
+    override fun lift(value: Int): UInt {
+        return value.toUInt()
+    }
 
-    override fun read(buf: ByteBuffer): UInt = lift(buf.getInt())
+    override fun read(buf: ByteBuffer): UInt {
+        return lift(buf.getInt())
+    }
 
-    override fun lower(value: UInt): Int = value.toInt()
+    override fun lower(value: UInt): Int {
+        return value.toInt()
+    }
 
     override fun allocationSize(value: UInt) = 4UL
 
-    override fun write(
-        value: UInt,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: UInt, buf: ByteBuffer) {
         buf.putInt(value.toInt())
     }
 }
 
-public object FfiConverterULong : FfiConverter<ULong, Long> {
-    override fun lift(value: Long): ULong = value.toULong()
+public object FfiConverterULong: FfiConverter<ULong, Long> {
+    override fun lift(value: Long): ULong {
+        return value.toULong()
+    }
 
-    override fun read(buf: ByteBuffer): ULong = lift(buf.getLong())
+    override fun read(buf: ByteBuffer): ULong {
+        return lift(buf.getLong())
+    }
 
-    override fun lower(value: ULong): Long = value.toLong()
+    override fun lower(value: ULong): Long {
+        return value.toLong()
+    }
 
     override fun allocationSize(value: ULong) = 8UL
 
-    override fun write(
-        value: ULong,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: ULong, buf: ByteBuffer) {
         buf.putLong(value.toLong())
     }
 }
 
-public object FfiConverterBoolean : FfiConverter<Boolean, Byte> {
-    override fun lift(value: Byte): Boolean = value.toInt() != 0
+public object FfiConverterBoolean: FfiConverter<Boolean, Byte> {
+    override fun lift(value: Byte): Boolean {
+        return value.toInt() != 0
+    }
 
-    override fun read(buf: ByteBuffer): Boolean = lift(buf.get())
+    override fun read(buf: ByteBuffer): Boolean {
+        return lift(buf.get())
+    }
 
-    override fun lower(value: Boolean): Byte = if (value) 1.toByte() else 0.toByte()
+    override fun lower(value: Boolean): Byte {
+        return if (value) 1.toByte() else 0.toByte()
+    }
 
     override fun allocationSize(value: Boolean) = 1UL
 
-    override fun write(
-        value: Boolean,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: Boolean, buf: ByteBuffer) {
         buf.put(lower(value))
     }
 }
 
-public object FfiConverterString : FfiConverter<String, RustBuffer.ByValue> {
+public object FfiConverterString: FfiConverter<String, RustBuffer.ByValue> {
     // Note: we don't inherit from FfiConverterRustBuffer, because we use a
     // special encoding when lowering/lifting.  We can use `RustBuffer.len` to
     // store our length and avoid writing it out to the buffer.
@@ -3354,36 +2861,31 @@ public object FfiConverterString : FfiConverter<String, RustBuffer.ByValue> {
         return sizeForLength + sizeForString
     }
 
-    override fun write(
-        value: String,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: String, buf: ByteBuffer) {
         val byteBuf = toUtf8(value)
         buf.putInt(byteBuf.limit())
         buf.put(byteBuf)
     }
 }
 
-public object FfiConverterByteArray : FfiConverterRustBuffer<ByteArray> {
+public object FfiConverterByteArray: FfiConverterRustBuffer<ByteArray> {
     override fun read(buf: ByteBuffer): ByteArray {
         val len = buf.getInt()
         val byteArr = ByteArray(len)
         buf.get(byteArr)
         return byteArr
     }
-
-    override fun allocationSize(value: ByteArray): ULong = 4UL + value.size.toULong()
-
-    override fun write(
-        value: ByteArray,
-        buf: ByteBuffer,
-    ) {
+    override fun allocationSize(value: ByteArray): ULong {
+        return 4UL + value.size.toULong()
+    }
+    override fun write(value: ByteArray, buf: ByteBuffer) {
         buf.putInt(value.size)
         buf.put(value)
     }
 }
 
-public object FfiConverterTimestamp : FfiConverterRustBuffer<java.time.Instant> {
+
+public object FfiConverterTimestamp: FfiConverterRustBuffer<java.time.Instant> {
     override fun read(buf: ByteBuffer): java.time.Instant {
         val seconds = buf.getLong()
         // Type mismatch (should be u32) but we check for overflow/underflow below
@@ -3392,21 +2894,16 @@ public object FfiConverterTimestamp : FfiConverterRustBuffer<java.time.Instant> 
             throw java.time.DateTimeException("Instant nanoseconds exceed minimum or maximum supported by uniffi")
         }
         if (seconds >= 0) {
-            return java.time.Instant.EPOCH
-                .plus(java.time.Duration.ofSeconds(seconds, nanoseconds))
+            return java.time.Instant.EPOCH.plus(java.time.Duration.ofSeconds(seconds, nanoseconds))
         } else {
-            return java.time.Instant.EPOCH
-                .minus(java.time.Duration.ofSeconds(-seconds, nanoseconds))
+            return java.time.Instant.EPOCH.minus(java.time.Duration.ofSeconds(-seconds, nanoseconds))
         }
     }
 
     // 8 bytes for seconds, 4 bytes for nanoseconds
     override fun allocationSize(value: java.time.Instant) = 12UL
 
-    override fun write(
-        value: java.time.Instant,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: java.time.Instant, buf: ByteBuffer) {
         var epochOffset = java.time.Duration.between(java.time.Instant.EPOCH, value)
 
         var sign = 1
@@ -3427,7 +2924,8 @@ public object FfiConverterTimestamp : FfiConverterRustBuffer<java.time.Instant> 
     }
 }
 
-public object FfiConverterDuration : FfiConverterRustBuffer<java.time.Duration> {
+
+public object FfiConverterDuration: FfiConverterRustBuffer<java.time.Duration> {
     override fun read(buf: ByteBuffer): java.time.Duration {
         // Type mismatch (should be u64) but we check for overflow/underflow below
         val seconds = buf.getLong()
@@ -3445,10 +2943,7 @@ public object FfiConverterDuration : FfiConverterRustBuffer<java.time.Duration> 
     // 8 bytes for seconds, 4 bytes for nanoseconds
     override fun allocationSize(value: java.time.Duration) = 12UL
 
-    override fun write(
-        value: java.time.Duration,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: java.time.Duration, buf: ByteBuffer) {
         if (value.seconds < 0) {
             // Rust does not support negative Durations
             throw IllegalArgumentException("Invalid duration, must be non-negative")
@@ -3466,6 +2961,7 @@ public object FfiConverterDuration : FfiConverterRustBuffer<java.time.Duration> 
         buf.putInt(value.nano)
     }
 }
+
 
 // This template implements a class for working with a Rust struct via a Pointer/Arc<T>
 // to the live Rust struct on the other side of the FFI.
@@ -3564,6 +3060,7 @@ public object FfiConverterDuration : FfiConverterRustBuffer<java.time.Duration> 
 // [1] https://stackoverflow.com/questions/24376768/can-java-finalize-an-object-when-it-is-still-in-scope/24380219
 //
 
+
 // The cleaner interface for Object finalization code to run.
 // This is the entry point to any implementation that we're using.
 //
@@ -3575,24 +3072,17 @@ interface UniffiCleaner {
         fun clean()
     }
 
-    fun register(
-        value: Any,
-        cleanUpTask: Runnable,
-    ): UniffiCleaner.Cleanable
+    fun register(value: Any, cleanUpTask: Runnable): UniffiCleaner.Cleanable
 
     companion object
 }
 
 // The fallback Jna cleaner, which is available for both Android, and the JVM.
 private class UniffiJnaCleaner : UniffiCleaner {
-    private val cleaner =
-        com.sun.jna.internal.Cleaner
-            .getCleaner()
+    private val cleaner = com.sun.jna.internal.Cleaner.getCleaner()
 
-    override fun register(
-        value: Any,
-        cleanUpTask: Runnable,
-    ): UniffiCleaner.Cleanable = UniffiJnaCleanable(cleaner.register(value, cleanUpTask))
+    override fun register(value: Any, cleanUpTask: Runnable): UniffiCleaner.Cleanable =
+        UniffiJnaCleanable(cleaner.register(value, cleanUpTask))
 }
 
 private class UniffiJnaCleanable(
@@ -3619,30 +3109,26 @@ private fun UniffiCleaner.Companion.create(): UniffiCleaner =
     }
 
 private class JavaLangRefCleaner : UniffiCleaner {
-    val cleaner =
-        java.lang.ref.Cleaner
-            .create()
+    val cleaner = java.lang.ref.Cleaner.create()
 
-    override fun register(
-        value: Any,
-        cleanUpTask: Runnable,
-    ): UniffiCleaner.Cleanable = JavaLangRefCleanable(cleaner.register(value, cleanUpTask))
+    override fun register(value: Any, cleanUpTask: Runnable): UniffiCleaner.Cleanable =
+        JavaLangRefCleanable(cleaner.register(value, cleanUpTask))
 }
 
 private class JavaLangRefCleanable(
-    val cleanable: java.lang.ref.Cleaner.Cleanable,
+    val cleanable: java.lang.ref.Cleaner.Cleanable
 ) : UniffiCleaner.Cleanable {
     override fun clean() = cleanable.clean()
 }
-
 /**
  * The `progress` method will be called for each `AddProgress` event that is
  * emitted during a `node.blobs_add_from_path`. Use the `AddProgress.type()`
  * method to check the `AddProgressType`
  */
 public interface AddCallback {
+    
     fun `progress`(`progress`: AddProgress)
-
+    
     companion object
 }
 
@@ -3651,10 +3137,8 @@ public interface AddCallback {
  * emitted during a `node.blobs_add_from_path`. Use the `AddProgress.type()`
  * method to check the `AddProgressType`
  */
-open class AddCallbackImpl :
-    Disposable,
-    AutoCloseable,
-    AddCallback {
+open class AddCallbackImpl: Disposable, AutoCloseable, AddCallback {
+
     constructor(pointer: Pointer) {
         this.pointer = pointer
         this.cleanable = UniffiLib.CLEANER.register(this, UniffiCleanAction(pointer))
@@ -3704,7 +3188,7 @@ open class AddCallbackImpl :
             if (c == Long.MAX_VALUE) {
                 throw IllegalStateException("${this.javaClass.simpleName} call counter would overflow")
             }
-        } while (!this.callCounter.compareAndSet(c, c + 1L))
+        } while (! this.callCounter.compareAndSet(c, c + 1L))
         // Now we can safely do the method call without the pointer being freed concurrently.
         try {
             return block(this.uniffiClonePointer())
@@ -3718,9 +3202,7 @@ open class AddCallbackImpl :
 
     // Use a static inner class instead of a closure so as not to accidentally
     // capture `this` as part of the cleanable's action.
-    private class UniffiCleanAction(
-        private val pointer: Pointer?,
-    ) : Runnable {
+    private class UniffiCleanAction(private val pointer: Pointer?) : Runnable {
         override fun run() {
             pointer?.let { ptr ->
                 uniffiRustCall { status ->
@@ -3730,45 +3212,49 @@ open class AddCallbackImpl :
         }
     }
 
-    fun uniffiClonePointer(): Pointer =
-        uniffiRustCall { status ->
+    fun uniffiClonePointer(): Pointer {
+        return uniffiRustCall() { status ->
             UniffiLib.INSTANCE.uniffi_iroh_fn_clone_addcallback(pointer!!, status)
         }
+    }
 
-    @Throws(
-        CallbackException::class,
-        )
-    override fun `progress`(`progress`: AddProgress) =
-        callWithPointer {
-            uniffiRustCallWithError(CallbackException) { _status ->
-                UniffiLib.INSTANCE.uniffi_iroh_fn_method_addcallback_progress(
-                    it,
-                    FfiConverterTypeAddProgress.lower(`progress`),
-                    _status,
-                )
-            }
-        }
-
-    companion object
+    
+    @Throws(CallbackException::class)override fun `progress`(`progress`: AddProgress)
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(CallbackException) { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_addcallback_progress(
+        it, FfiConverterTypeAddProgress.lower(`progress`),_status)
 }
+    }
+    
+    
 
+    
+
+    
+    
+    companion object
+    
+}
 // Magic number for the Rust proxy to call using the same mechanism as every other method,
 // to free the callback once it's dropped by Rust.
 internal const val IDX_CALLBACK_FREE = 0
-
 // Callback return codes
 internal const val UNIFFI_CALLBACK_SUCCESS = 0
 internal const val UNIFFI_CALLBACK_ERROR = 1
 internal const val UNIFFI_CALLBACK_UNEXPECTED_ERROR = 2
 
-public abstract class FfiConverterCallbackInterface<CallbackInterface : Any> : FfiConverter<CallbackInterface, Long> {
+public abstract class FfiConverterCallbackInterface<CallbackInterface: Any>: FfiConverter<CallbackInterface, Long> {
     internal val handleMap = UniffiHandleMap<CallbackInterface>()
 
     internal fun drop(handle: Long) {
         handleMap.remove(handle)
     }
 
-    override fun lift(value: Long): CallbackInterface = handleMap.get(value)
+    override fun lift(value: Long): CallbackInterface {
+        return handleMap.get(value)
+    }
 
     override fun read(buf: ByteBuffer) = lift(buf.getLong())
 
@@ -3776,49 +3262,41 @@ public abstract class FfiConverterCallbackInterface<CallbackInterface : Any> : F
 
     override fun allocationSize(value: CallbackInterface) = 8UL
 
-    override fun write(
-        value: CallbackInterface,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: CallbackInterface, buf: ByteBuffer) {
         buf.putLong(lower(value))
     }
 }
 
 // Put the implementation in an object so we don't pollute the top-level namespace
 internal object uniffiCallbackInterfaceAddCallback {
-    internal object `progress` : UniffiCallbackInterfaceAddCallbackMethod0 {
-        override fun callback(
-            `uniffiHandle`: Long,
-            `progress`: Pointer,
-            `uniffiOutReturn`: Pointer,
-            uniffiCallStatus: UniffiRustCallStatus,
-        ) {
+    internal object `progress`: UniffiCallbackInterfaceAddCallbackMethod0 {
+        override fun callback(`uniffiHandle`: Long,`progress`: Pointer,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,) {
             val uniffiObj = FfiConverterTypeAddCallback.handleMap.get(uniffiHandle)
-            val makeCall = {  uniffiObj.`progress`(
-                FfiConverterTypeAddProgress.lift(`progress`),
-            )
+            val makeCall = { ->
+                uniffiObj.`progress`(
+                    FfiConverterTypeAddProgress.lift(`progress`),
+                )
             }
             val writeReturn = { _: Unit -> Unit }
             uniffiTraitInterfaceCallWithError(
                 uniffiCallStatus,
                 makeCall,
                 writeReturn,
-                { e: CallbackException -> FfiConverterTypeCallbackError.lower(e) },
+                { e: CallbackException -> FfiConverterTypeCallbackError.lower(e) }
             )
         }
     }
 
-    internal object uniffiFree : UniffiCallbackInterfaceFree {
+    internal object uniffiFree: UniffiCallbackInterfaceFree {
         override fun callback(handle: Long) {
             FfiConverterTypeAddCallback.handleMap.remove(handle)
         }
     }
 
-    internal var vtable =
-        UniffiVTableCallbackInterfaceAddCallback.UniffiByValue(
-            `progress`,
-            uniffiFree,
-        )
+    internal var vtable = UniffiVTableCallbackInterfaceAddCallback.UniffiByValue(
+        `progress`,
+        uniffiFree,
+    )
 
     // Registers the foreign callback with the Rust side.
     // This method is generated for each callback interface.
@@ -3827,12 +3305,16 @@ internal object uniffiCallbackInterfaceAddCallback {
     }
 }
 
-public object FfiConverterTypeAddCallback : FfiConverter<AddCallback, Pointer> {
+public object FfiConverterTypeAddCallback: FfiConverter<AddCallback, Pointer> {
     internal val handleMap = UniffiHandleMap<AddCallback>()
 
-    override fun lower(value: AddCallback): Pointer = Pointer(handleMap.insert(value))
+    override fun lower(value: AddCallback): Pointer {
+        return Pointer(handleMap.insert(value))
+    }
 
-    override fun lift(value: Pointer): AddCallback = AddCallbackImpl(value)
+    override fun lift(value: Pointer): AddCallback {
+        return AddCallbackImpl(value)
+    }
 
     override fun read(buf: ByteBuffer): AddCallback {
         // The Rust code always writes pointers as 8 bytes, and will
@@ -3842,15 +3324,13 @@ public object FfiConverterTypeAddCallback : FfiConverter<AddCallback, Pointer> {
 
     override fun allocationSize(value: AddCallback) = 8UL
 
-    override fun write(
-        value: AddCallback,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: AddCallback, buf: ByteBuffer) {
         // The Rust code always expects pointers written as 8 bytes,
         // and will fail to compile if they don't fit.
         buf.putLong(Pointer.nativeValue(lower(value)))
     }
 }
+
 
 // This template implements a class for working with a Rust struct via a Pointer/Arc<T>
 // to the live Rust struct on the other side of the FFI.
@@ -3949,50 +3429,50 @@ public object FfiConverterTypeAddCallback : FfiConverter<AddCallback, Pointer> {
 // [1] https://stackoverflow.com/questions/24376768/can-java-finalize-an-object-when-it-is-still-in-scope/24380219
 //
 
+
 /**
  * Progress updates for the add operation.
  */
 public interface AddProgressInterface {
+    
     /**
      * Return the `AddProgressAbort`
      */
     fun `asAbort`(): AddProgressAbort
-
+    
     /**
      * Return the `AddAllDone`
      */
     fun `asAllDone`(): AddProgressAllDone
-
+    
     /**
      * Return the `AddProgressDone` event
      */
     fun `asDone`(): AddProgressDone
-
+    
     /**
      * Return the `AddProgressFound` event
      */
     fun `asFound`(): AddProgressFound
-
+    
     /**
      * Return the `AddProgressProgress` event
      */
     fun `asProgress`(): AddProgressProgress
-
+    
     /**
      * Get the type of event
      */
     fun `type`(): AddProgressType
-
+    
     companion object
 }
 
 /**
  * Progress updates for the add operation.
  */
-open class AddProgress :
-    Disposable,
-    AutoCloseable,
-    AddProgressInterface {
+open class AddProgress: Disposable, AutoCloseable, AddProgressInterface {
+
     constructor(pointer: Pointer) {
         this.pointer = pointer
         this.cleanable = UniffiLib.CLEANER.register(this, UniffiCleanAction(pointer))
@@ -4042,7 +3522,7 @@ open class AddProgress :
             if (c == Long.MAX_VALUE) {
                 throw IllegalStateException("${this.javaClass.simpleName} call counter would overflow")
             }
-        } while (!this.callCounter.compareAndSet(c, c + 1L))
+        } while (! this.callCounter.compareAndSet(c, c + 1L))
         // Now we can safely do the method call without the pointer being freed concurrently.
         try {
             return block(this.uniffiClonePointer())
@@ -4056,9 +3536,7 @@ open class AddProgress :
 
     // Use a static inner class instead of a closure so as not to accidentally
     // capture `this` as part of the cleanable's action.
-    private class UniffiCleanAction(
-        private val pointer: Pointer?,
-    ) : Runnable {
+    private class UniffiCleanAction(private val pointer: Pointer?) : Runnable {
         override fun run() {
             pointer?.let { ptr ->
                 uniffiRustCall { status ->
@@ -4068,108 +3546,119 @@ open class AddProgress :
         }
     }
 
-    fun uniffiClonePointer(): Pointer =
-        uniffiRustCall { status ->
+    fun uniffiClonePointer(): Pointer {
+        return uniffiRustCall() { status ->
             UniffiLib.INSTANCE.uniffi_iroh_fn_clone_addprogress(pointer!!, status)
         }
+    }
 
+    
     /**
      * Return the `AddProgressAbort`
-     */
-    override fun `asAbort`(): AddProgressAbort =
-        FfiConverterTypeAddProgressAbort.lift(
-            callWithPointer {
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_addprogress_as_abort(
-                        it,
-                        _status,
-                    )
-                }
-            },
-        )
+     */override fun `asAbort`(): AddProgressAbort {
+            return FfiConverterTypeAddProgressAbort.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_addprogress_as_abort(
+        it, _status)
+}
+    }
+    )
+    }
+    
 
+    
     /**
      * Return the `AddAllDone`
-     */
-    override fun `asAllDone`(): AddProgressAllDone =
-        FfiConverterTypeAddProgressAllDone.lift(
-            callWithPointer {
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_addprogress_as_all_done(
-                        it,
-                        _status,
-                    )
-                }
-            },
-        )
+     */override fun `asAllDone`(): AddProgressAllDone {
+            return FfiConverterTypeAddProgressAllDone.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_addprogress_as_all_done(
+        it, _status)
+}
+    }
+    )
+    }
+    
 
+    
     /**
      * Return the `AddProgressDone` event
-     */
-    override fun `asDone`(): AddProgressDone =
-        FfiConverterTypeAddProgressDone.lift(
-            callWithPointer {
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_addprogress_as_done(
-                        it,
-                        _status,
-                    )
-                }
-            },
-        )
+     */override fun `asDone`(): AddProgressDone {
+            return FfiConverterTypeAddProgressDone.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_addprogress_as_done(
+        it, _status)
+}
+    }
+    )
+    }
+    
 
+    
     /**
      * Return the `AddProgressFound` event
-     */
-    override fun `asFound`(): AddProgressFound =
-        FfiConverterTypeAddProgressFound.lift(
-            callWithPointer {
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_addprogress_as_found(
-                        it,
-                        _status,
-                    )
-                }
-            },
-        )
+     */override fun `asFound`(): AddProgressFound {
+            return FfiConverterTypeAddProgressFound.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_addprogress_as_found(
+        it, _status)
+}
+    }
+    )
+    }
+    
 
+    
     /**
      * Return the `AddProgressProgress` event
-     */
-    override fun `asProgress`(): AddProgressProgress =
-        FfiConverterTypeAddProgressProgress.lift(
-            callWithPointer {
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_addprogress_as_progress(
-                        it,
-                        _status,
-                    )
-                }
-            },
-        )
+     */override fun `asProgress`(): AddProgressProgress {
+            return FfiConverterTypeAddProgressProgress.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_addprogress_as_progress(
+        it, _status)
+}
+    }
+    )
+    }
+    
 
+    
     /**
      * Get the type of event
-     */
-    override fun `type`(): AddProgressType =
-        FfiConverterTypeAddProgressType.lift(
-            callWithPointer {
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_addprogress_type(
-                        it,
-                        _status,
-                    )
-                }
-            },
-        )
+     */override fun `type`(): AddProgressType {
+            return FfiConverterTypeAddProgressType.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_addprogress_type(
+        it, _status)
+}
+    }
+    )
+    }
+    
 
+    
+
+    
+    
     companion object
+    
 }
 
-public object FfiConverterTypeAddProgress : FfiConverter<AddProgress, Pointer> {
-    override fun lower(value: AddProgress): Pointer = value.uniffiClonePointer()
+public object FfiConverterTypeAddProgress: FfiConverter<AddProgress, Pointer> {
 
-    override fun lift(value: Pointer): AddProgress = AddProgress(value)
+    override fun lower(value: AddProgress): Pointer {
+        return value.uniffiClonePointer()
+    }
+
+    override fun lift(value: Pointer): AddProgress {
+        return AddProgress(value)
+    }
 
     override fun read(buf: ByteBuffer): AddProgress {
         // The Rust code always writes pointers as 8 bytes, and will
@@ -4179,15 +3668,13 @@ public object FfiConverterTypeAddProgress : FfiConverter<AddProgress, Pointer> {
 
     override fun allocationSize(value: AddProgress) = 8UL
 
-    override fun write(
-        value: AddProgress,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: AddProgress, buf: ByteBuffer) {
         // The Rust code always expects pointers written as 8 bytes,
         // and will fail to compile if they don't fit.
         buf.putLong(Pointer.nativeValue(lower(value)))
     }
 }
+
 
 // This template implements a class for working with a Rust struct via a Pointer/Arc<T>
 // to the live Rust struct on the other side of the FFI.
@@ -4286,17 +3773,19 @@ public object FfiConverterTypeAddProgress : FfiConverter<AddProgress, Pointer> {
 // [1] https://stackoverflow.com/questions/24376768/can-java-finalize-an-object-when-it-is-still-in-scope/24380219
 //
 
+
 /**
  * Author key to insert entries in a document
  *
  * Internally, an author is a `SigningKey` which is used to sign entries.
  */
 public interface AuthorInterface {
+    
     /**
      * Get the [`AuthorId`] of this Author
      */
     fun `id`(): AuthorId
-
+    
     companion object
 }
 
@@ -4305,10 +3794,8 @@ public interface AuthorInterface {
  *
  * Internally, an author is a `SigningKey` which is used to sign entries.
  */
-open class Author :
-    Disposable,
-    AutoCloseable,
-    AuthorInterface {
+open class Author: Disposable, AutoCloseable, AuthorInterface {
+
     constructor(pointer: Pointer) {
         this.pointer = pointer
         this.cleanable = UniffiLib.CLEANER.register(this, UniffiCleanAction(pointer))
@@ -4358,7 +3845,7 @@ open class Author :
             if (c == Long.MAX_VALUE) {
                 throw IllegalStateException("${this.javaClass.simpleName} call counter would overflow")
             }
-        } while (!this.callCounter.compareAndSet(c, c + 1L))
+        } while (! this.callCounter.compareAndSet(c, c + 1L))
         // Now we can safely do the method call without the pointer being freed concurrently.
         try {
             return block(this.uniffiClonePointer())
@@ -4372,9 +3859,7 @@ open class Author :
 
     // Use a static inner class instead of a closure so as not to accidentally
     // capture `this` as part of the cleanable's action.
-    private class UniffiCleanAction(
-        private val pointer: Pointer?,
-    ) : Runnable {
+    private class UniffiCleanAction(private val pointer: Pointer?) : Runnable {
         override fun run() {
             pointer?.let { ptr ->
                 uniffiRustCall { status ->
@@ -4384,59 +3869,70 @@ open class Author :
         }
     }
 
-    fun uniffiClonePointer(): Pointer =
-        uniffiRustCall { status ->
+    fun uniffiClonePointer(): Pointer {
+        return uniffiRustCall() { status ->
             UniffiLib.INSTANCE.uniffi_iroh_fn_clone_author(pointer!!, status)
         }
+    }
 
+    
     /**
      * Get the [`AuthorId`] of this Author
-     */
-    override fun `id`(): AuthorId =
-        FfiConverterTypeAuthorId.lift(
-            callWithPointer {
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_author_id(
-                        it,
-                        _status,
-                    )
-                }
-            },
-        )
-
-    override fun toString(): String =
-        FfiConverterString.lift(
-            callWithPointer {
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_author_uniffi_trait_display(
-                        it,
-                        _status,
-                    )
-                }
-            },
-        )
-
-    companion object {
-        /**
-         * Get an [`Author`] from a String
-         */
-        @Throws(IrohException::class)
-        fun `fromString`(`str`: kotlin.String): Author =
-            FfiConverterTypeAuthor.lift(
-                uniffiRustCallWithError(IrohException) { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_constructor_author_from_string(
-                        FfiConverterString.lower(`str`),
-                        _status,
-                    )
-                },
-            )
+     */override fun `id`(): AuthorId {
+            return FfiConverterTypeAuthorId.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_author_id(
+        it, _status)
+}
     }
+    )
+    }
+    
+
+    
+    override fun toString(): String {
+        return FfiConverterString.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_author_uniffi_trait_display(
+        it, _status)
+}
+    }
+    )
+    }
+    
+
+    
+    companion object {
+        
+    /**
+     * Get an [`Author`] from a String
+     */
+    @Throws(IrohException::class) fun `fromString`(`str`: kotlin.String): Author {
+            return FfiConverterTypeAuthor.lift(
+    uniffiRustCallWithError(IrohException) { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_constructor_author_from_string(
+        FfiConverterString.lower(`str`),_status)
+}
+    )
+    }
+    
+
+        
+    }
+    
 }
 
-public object FfiConverterTypeAuthor : FfiConverter<Author, Pointer> {
-    override fun lower(value: Author): Pointer = value.uniffiClonePointer()
+public object FfiConverterTypeAuthor: FfiConverter<Author, Pointer> {
 
-    override fun lift(value: Pointer): Author = Author(value)
+    override fun lower(value: Author): Pointer {
+        return value.uniffiClonePointer()
+    }
+
+    override fun lift(value: Pointer): Author {
+        return Author(value)
+    }
 
     override fun read(buf: ByteBuffer): Author {
         // The Rust code always writes pointers as 8 bytes, and will
@@ -4446,15 +3942,13 @@ public object FfiConverterTypeAuthor : FfiConverter<Author, Pointer> {
 
     override fun allocationSize(value: Author) = 8UL
 
-    override fun write(
-        value: Author,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: Author, buf: ByteBuffer) {
         // The Rust code always expects pointers written as 8 bytes,
         // and will fail to compile if they don't fit.
         buf.putLong(Pointer.nativeValue(lower(value)))
     }
 }
+
 
 // This template implements a class for working with a Rust struct via a Pointer/Arc<T>
 // to the live Rust struct on the other side of the FFI.
@@ -4553,25 +4047,25 @@ public object FfiConverterTypeAuthor : FfiConverter<Author, Pointer> {
 // [1] https://stackoverflow.com/questions/24376768/can-java-finalize-an-object-when-it-is-still-in-scope/24380219
 //
 
+
 /**
  * Identifier for an [`Author`]
  */
 public interface AuthorIdInterface {
+    
     /**
      * Returns true when both AuthorId's have the same value
      */
     fun `equal`(`other`: AuthorId): kotlin.Boolean
-
+    
     companion object
 }
 
 /**
  * Identifier for an [`Author`]
  */
-open class AuthorId :
-    Disposable,
-    AutoCloseable,
-    AuthorIdInterface {
+open class AuthorId: Disposable, AutoCloseable, AuthorIdInterface {
+
     constructor(pointer: Pointer) {
         this.pointer = pointer
         this.cleanable = UniffiLib.CLEANER.register(this, UniffiCleanAction(pointer))
@@ -4621,7 +4115,7 @@ open class AuthorId :
             if (c == Long.MAX_VALUE) {
                 throw IllegalStateException("${this.javaClass.simpleName} call counter would overflow")
             }
-        } while (!this.callCounter.compareAndSet(c, c + 1L))
+        } while (! this.callCounter.compareAndSet(c, c + 1L))
         // Now we can safely do the method call without the pointer being freed concurrently.
         try {
             return block(this.uniffiClonePointer())
@@ -4635,9 +4129,7 @@ open class AuthorId :
 
     // Use a static inner class instead of a closure so as not to accidentally
     // capture `this` as part of the cleanable's action.
-    private class UniffiCleanAction(
-        private val pointer: Pointer?,
-    ) : Runnable {
+    private class UniffiCleanAction(private val pointer: Pointer?) : Runnable {
         override fun run() {
             pointer?.let { ptr ->
                 uniffiRustCall { status ->
@@ -4647,60 +4139,70 @@ open class AuthorId :
         }
     }
 
-    fun uniffiClonePointer(): Pointer =
-        uniffiRustCall { status ->
+    fun uniffiClonePointer(): Pointer {
+        return uniffiRustCall() { status ->
             UniffiLib.INSTANCE.uniffi_iroh_fn_clone_authorid(pointer!!, status)
         }
+    }
 
+    
     /**
      * Returns true when both AuthorId's have the same value
-     */
-    override fun `equal`(`other`: AuthorId): kotlin.Boolean =
-        FfiConverterBoolean.lift(
-            callWithPointer {
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_authorid_equal(
-                        it,
-                        FfiConverterTypeAuthorId.lower(`other`),
-                        _status,
-                    )
-                }
-            },
-        )
-
-    override fun toString(): String =
-        FfiConverterString.lift(
-            callWithPointer {
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_authorid_uniffi_trait_display(
-                        it,
-                        _status,
-                    )
-                }
-            },
-        )
-
-    companion object {
-        /**
-         * Get an [`AuthorId`] from a String
-         */
-        @Throws(IrohException::class)
-        fun `fromString`(`str`: kotlin.String): AuthorId =
-            FfiConverterTypeAuthorId.lift(
-                uniffiRustCallWithError(IrohException) { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_constructor_authorid_from_string(
-                        FfiConverterString.lower(`str`),
-                        _status,
-                    )
-                },
-            )
+     */override fun `equal`(`other`: AuthorId): kotlin.Boolean {
+            return FfiConverterBoolean.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_authorid_equal(
+        it, FfiConverterTypeAuthorId.lower(`other`),_status)
+}
     }
+    )
+    }
+    
+
+    
+    override fun toString(): String {
+        return FfiConverterString.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_authorid_uniffi_trait_display(
+        it, _status)
+}
+    }
+    )
+    }
+    
+
+    
+    companion object {
+        
+    /**
+     * Get an [`AuthorId`] from a String
+     */
+    @Throws(IrohException::class) fun `fromString`(`str`: kotlin.String): AuthorId {
+            return FfiConverterTypeAuthorId.lift(
+    uniffiRustCallWithError(IrohException) { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_constructor_authorid_from_string(
+        FfiConverterString.lower(`str`),_status)
+}
+    )
+    }
+    
+
+        
+    }
+    
 }
 
-public object FfiConverterTypeAuthorId : FfiConverter<AuthorId, Pointer> {
-    override fun lower(value: AuthorId): Pointer = value.uniffiClonePointer()
+public object FfiConverterTypeAuthorId: FfiConverter<AuthorId, Pointer> {
 
-    override fun lift(value: Pointer): AuthorId = AuthorId(value)
+    override fun lower(value: AuthorId): Pointer {
+        return value.uniffiClonePointer()
+    }
+
+    override fun lift(value: Pointer): AuthorId {
+        return AuthorId(value)
+    }
 
     override fun read(buf: ByteBuffer): AuthorId {
         // The Rust code always writes pointers as 8 bytes, and will
@@ -4710,15 +4212,13 @@ public object FfiConverterTypeAuthorId : FfiConverter<AuthorId, Pointer> {
 
     override fun allocationSize(value: AuthorId) = 8UL
 
-    override fun write(
-        value: AuthorId,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: AuthorId, buf: ByteBuffer) {
         // The Rust code always expects pointers written as 8 bytes,
         // and will fail to compile if they don't fit.
         buf.putLong(Pointer.nativeValue(lower(value)))
     }
 }
+
 
 // This template implements a class for working with a Rust struct via a Pointer/Arc<T>
 // to the live Rust struct on the other side of the FFI.
@@ -4817,20 +4317,20 @@ public object FfiConverterTypeAuthorId : FfiConverter<AuthorId, Pointer> {
 // [1] https://stackoverflow.com/questions/24376768/can-java-finalize-an-object-when-it-is-still-in-scope/24380219
 //
 
+
 /**
  * A request to the node to download and share the data specified by the hash.
  */
 public interface BlobDownloadOptionsInterface {
+    
     companion object
 }
 
 /**
  * A request to the node to download and share the data specified by the hash.
  */
-open class BlobDownloadOptions :
-    Disposable,
-    AutoCloseable,
-    BlobDownloadOptionsInterface {
+open class BlobDownloadOptions: Disposable, AutoCloseable, BlobDownloadOptionsInterface {
+
     constructor(pointer: Pointer) {
         this.pointer = pointer
         this.cleanable = UniffiLib.CLEANER.register(this, UniffiCleanAction(pointer))
@@ -4848,15 +4348,11 @@ open class BlobDownloadOptions :
     }
     constructor(`format`: BlobFormat, `node`: NodeAddr, `tag`: SetTagOption) :
         this(
-            uniffiRustCallWithError(IrohException) { _status ->
-                UniffiLib.INSTANCE.uniffi_iroh_fn_constructor_blobdownloadoptions_new(
-                    FfiConverterTypeBlobFormat.lower(`format`),
-                    FfiConverterTypeNodeAddr.lower(`node`),
-                    FfiConverterTypeSetTagOption.lower(`tag`),
-                    _status,
-                )
-            },
-        )
+    uniffiRustCallWithError(IrohException) { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_constructor_blobdownloadoptions_new(
+        FfiConverterTypeBlobFormat.lower(`format`),FfiConverterTypeNodeAddr.lower(`node`),FfiConverterTypeSetTagOption.lower(`tag`),_status)
+}
+    )
 
     protected val pointer: Pointer?
     protected val cleanable: UniffiCleaner.Cleanable
@@ -4891,7 +4387,7 @@ open class BlobDownloadOptions :
             if (c == Long.MAX_VALUE) {
                 throw IllegalStateException("${this.javaClass.simpleName} call counter would overflow")
             }
-        } while (!this.callCounter.compareAndSet(c, c + 1L))
+        } while (! this.callCounter.compareAndSet(c, c + 1L))
         // Now we can safely do the method call without the pointer being freed concurrently.
         try {
             return block(this.uniffiClonePointer())
@@ -4905,9 +4401,7 @@ open class BlobDownloadOptions :
 
     // Use a static inner class instead of a closure so as not to accidentally
     // capture `this` as part of the cleanable's action.
-    private class UniffiCleanAction(
-        private val pointer: Pointer?,
-    ) : Runnable {
+    private class UniffiCleanAction(private val pointer: Pointer?) : Runnable {
         override fun run() {
             pointer?.let { ptr ->
                 uniffiRustCall { status ->
@@ -4917,18 +4411,29 @@ open class BlobDownloadOptions :
         }
     }
 
-    fun uniffiClonePointer(): Pointer =
-        uniffiRustCall { status ->
+    fun uniffiClonePointer(): Pointer {
+        return uniffiRustCall() { status ->
             UniffiLib.INSTANCE.uniffi_iroh_fn_clone_blobdownloadoptions(pointer!!, status)
         }
+    }
 
+    
+
+    
+    
     companion object
+    
 }
 
-public object FfiConverterTypeBlobDownloadOptions : FfiConverter<BlobDownloadOptions, Pointer> {
-    override fun lower(value: BlobDownloadOptions): Pointer = value.uniffiClonePointer()
+public object FfiConverterTypeBlobDownloadOptions: FfiConverter<BlobDownloadOptions, Pointer> {
 
-    override fun lift(value: Pointer): BlobDownloadOptions = BlobDownloadOptions(value)
+    override fun lower(value: BlobDownloadOptions): Pointer {
+        return value.uniffiClonePointer()
+    }
+
+    override fun lift(value: Pointer): BlobDownloadOptions {
+        return BlobDownloadOptions(value)
+    }
 
     override fun read(buf: ByteBuffer): BlobDownloadOptions {
         // The Rust code always writes pointers as 8 bytes, and will
@@ -4938,15 +4443,13 @@ public object FfiConverterTypeBlobDownloadOptions : FfiConverter<BlobDownloadOpt
 
     override fun allocationSize(value: BlobDownloadOptions) = 8UL
 
-    override fun write(
-        value: BlobDownloadOptions,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: BlobDownloadOptions, buf: ByteBuffer) {
         // The Rust code always expects pointers written as 8 bytes,
         // and will fail to compile if they don't fit.
         buf.putLong(Pointer.nativeValue(lower(value)))
     }
 }
+
 
 // This template implements a class for working with a Rust struct via a Pointer/Arc<T>
 // to the live Rust struct on the other side of the FFI.
@@ -5045,32 +4548,34 @@ public object FfiConverterTypeBlobDownloadOptions : FfiConverter<BlobDownloadOpt
 // [1] https://stackoverflow.com/questions/24376768/can-java-finalize-an-object-when-it-is-still-in-scope/24380219
 //
 
+
 /**
  * A token containing everything to get a file from the provider.
  *
  * It is a single item which can be easily serialized and deserialized.
  */
 public interface BlobTicketInterface {
+    
     /**
      * Turn this ticket into parameters for blobs_download.
      */
     fun `asDownloadOptions`(): BlobDownloadOptions
-
+    
     /**
      * The format of the blob.
      */
     fun `format`(): BlobFormat
-
+    
     /**
      * The hash to retrieve.
      */
     fun `hash`(): Hash
-
+    
     /**
      * The provider to get a file from.
      */
     fun `nodeAddr`(): NodeAddr
-
+    
     companion object
 }
 
@@ -5079,10 +4584,8 @@ public interface BlobTicketInterface {
  *
  * It is a single item which can be easily serialized and deserialized.
  */
-open class BlobTicket :
-    Disposable,
-    AutoCloseable,
-    BlobTicketInterface {
+open class BlobTicket: Disposable, AutoCloseable, BlobTicketInterface {
+
     constructor(pointer: Pointer) {
         this.pointer = pointer
         this.cleanable = UniffiLib.CLEANER.register(this, UniffiCleanAction(pointer))
@@ -5100,13 +4603,11 @@ open class BlobTicket :
     }
     constructor(`ticket`: kotlin.String) :
         this(
-            uniffiRustCallWithError(IrohException) { _status ->
-                UniffiLib.INSTANCE.uniffi_iroh_fn_constructor_blobticket_new(
-                    FfiConverterString.lower(`ticket`),
-                    _status,
-                )
-            },
-        )
+    uniffiRustCallWithError(IrohException) { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_constructor_blobticket_new(
+        FfiConverterString.lower(`ticket`),_status)
+}
+    )
 
     protected val pointer: Pointer?
     protected val cleanable: UniffiCleaner.Cleanable
@@ -5141,7 +4642,7 @@ open class BlobTicket :
             if (c == Long.MAX_VALUE) {
                 throw IllegalStateException("${this.javaClass.simpleName} call counter would overflow")
             }
-        } while (!this.callCounter.compareAndSet(c, c + 1L))
+        } while (! this.callCounter.compareAndSet(c, c + 1L))
         // Now we can safely do the method call without the pointer being freed concurrently.
         try {
             return block(this.uniffiClonePointer())
@@ -5155,9 +4656,7 @@ open class BlobTicket :
 
     // Use a static inner class instead of a closure so as not to accidentally
     // capture `this` as part of the cleanable's action.
-    private class UniffiCleanAction(
-        private val pointer: Pointer?,
-    ) : Runnable {
+    private class UniffiCleanAction(private val pointer: Pointer?) : Runnable {
         override fun run() {
             pointer?.let { ptr ->
                 uniffiRustCall { status ->
@@ -5167,78 +4666,89 @@ open class BlobTicket :
         }
     }
 
-    fun uniffiClonePointer(): Pointer =
-        uniffiRustCall { status ->
+    fun uniffiClonePointer(): Pointer {
+        return uniffiRustCall() { status ->
             UniffiLib.INSTANCE.uniffi_iroh_fn_clone_blobticket(pointer!!, status)
         }
+    }
 
+    
     /**
      * Turn this ticket into parameters for blobs_download.
-     */
-    override fun `asDownloadOptions`(): BlobDownloadOptions =
-        FfiConverterTypeBlobDownloadOptions.lift(
-            callWithPointer {
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_blobticket_as_download_options(
-                        it,
-                        _status,
-                    )
-                }
-            },
-        )
+     */override fun `asDownloadOptions`(): BlobDownloadOptions {
+            return FfiConverterTypeBlobDownloadOptions.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_blobticket_as_download_options(
+        it, _status)
+}
+    }
+    )
+    }
+    
 
+    
     /**
      * The format of the blob.
-     */
-    override fun `format`(): BlobFormat =
-        FfiConverterTypeBlobFormat.lift(
-            callWithPointer {
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_blobticket_format(
-                        it,
-                        _status,
-                    )
-                }
-            },
-        )
+     */override fun `format`(): BlobFormat {
+            return FfiConverterTypeBlobFormat.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_blobticket_format(
+        it, _status)
+}
+    }
+    )
+    }
+    
 
+    
     /**
      * The hash to retrieve.
-     */
-    override fun `hash`(): Hash =
-        FfiConverterTypeHash.lift(
-            callWithPointer {
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_blobticket_hash(
-                        it,
-                        _status,
-                    )
-                }
-            },
-        )
+     */override fun `hash`(): Hash {
+            return FfiConverterTypeHash.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_blobticket_hash(
+        it, _status)
+}
+    }
+    )
+    }
+    
 
+    
     /**
      * The provider to get a file from.
-     */
-    override fun `nodeAddr`(): NodeAddr =
-        FfiConverterTypeNodeAddr.lift(
-            callWithPointer {
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_blobticket_node_addr(
-                        it,
-                        _status,
-                    )
-                }
-            },
-        )
+     */override fun `nodeAddr`(): NodeAddr {
+            return FfiConverterTypeNodeAddr.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_blobticket_node_addr(
+        it, _status)
+}
+    }
+    )
+    }
+    
 
+    
+
+    
+    
     companion object
+    
 }
 
-public object FfiConverterTypeBlobTicket : FfiConverter<BlobTicket, Pointer> {
-    override fun lower(value: BlobTicket): Pointer = value.uniffiClonePointer()
+public object FfiConverterTypeBlobTicket: FfiConverter<BlobTicket, Pointer> {
 
-    override fun lift(value: Pointer): BlobTicket = BlobTicket(value)
+    override fun lower(value: BlobTicket): Pointer {
+        return value.uniffiClonePointer()
+    }
+
+    override fun lift(value: Pointer): BlobTicket {
+        return BlobTicket(value)
+    }
 
     override fun read(buf: ByteBuffer): BlobTicket {
         // The Rust code always writes pointers as 8 bytes, and will
@@ -5248,15 +4758,13 @@ public object FfiConverterTypeBlobTicket : FfiConverter<BlobTicket, Pointer> {
 
     override fun allocationSize(value: BlobTicket) = 8UL
 
-    override fun write(
-        value: BlobTicket,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: BlobTicket, buf: ByteBuffer) {
         // The Rust code always expects pointers written as 8 bytes,
         // and will fail to compile if they don't fit.
         buf.putLong(Pointer.nativeValue(lower(value)))
     }
 }
+
 
 // This template implements a class for working with a Rust struct via a Pointer/Arc<T>
 // to the live Rust struct on the other side of the FFI.
@@ -5355,45 +4863,44 @@ public object FfiConverterTypeBlobTicket : FfiConverter<BlobTicket, Pointer> {
 // [1] https://stackoverflow.com/questions/24376768/can-java-finalize-an-object-when-it-is-still-in-scope/24380219
 //
 
+
 /**
  * A collection of blobs
  *
  * Note that the format is subject to change.
  */
 public interface CollectionInterface {
+    
     /**
      * Returns a [`Link`] (the name and the hash), for each blob in the collection.
      */
     fun `blobs`(): List<LinkAndName>
-
+    
     /**
      * Check if the collection is empty
      */
     fun `isEmpty`(): kotlin.Boolean
-
+    
     /**
      * Returns the number of blobs in this collection
      */
     fun `len`(): kotlin.ULong
-
+    
     /**
      * Get the links to the blobs in this collection
      */
     fun `links`(): List<Hash>
-
+    
     /**
      * Get the names of the blobs in this collection
      */
     fun `names`(): List<kotlin.String>
-
+    
     /**
      * Add the given blob to the collection
      */
-    fun `push`(
-        `name`: kotlin.String,
-        `hash`: Hash,
-    )
-
+    fun `push`(`name`: kotlin.String, `hash`: Hash)
+    
     companion object
 }
 
@@ -5402,10 +4909,8 @@ public interface CollectionInterface {
  *
  * Note that the format is subject to change.
  */
-open class Collection :
-    Disposable,
-    AutoCloseable,
-    CollectionInterface {
+open class Collection: Disposable, AutoCloseable, CollectionInterface {
+
     constructor(pointer: Pointer) {
         this.pointer = pointer
         this.cleanable = UniffiLib.CLEANER.register(this, UniffiCleanAction(pointer))
@@ -5421,18 +4926,16 @@ open class Collection :
         this.pointer = null
         this.cleanable = UniffiLib.CLEANER.register(this, UniffiCleanAction(pointer))
     }
-
     /**
      * Create a new empty collection
      */
     constructor() :
         this(
-            uniffiRustCall { _status ->
-                UniffiLib.INSTANCE.uniffi_iroh_fn_constructor_collection_new(
-                    _status,
-                )
-            },
-        )
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_constructor_collection_new(
+        _status)
+}
+    )
 
     protected val pointer: Pointer?
     protected val cleanable: UniffiCleaner.Cleanable
@@ -5467,7 +4970,7 @@ open class Collection :
             if (c == Long.MAX_VALUE) {
                 throw IllegalStateException("${this.javaClass.simpleName} call counter would overflow")
             }
-        } while (!this.callCounter.compareAndSet(c, c + 1L))
+        } while (! this.callCounter.compareAndSet(c, c + 1L))
         // Now we can safely do the method call without the pointer being freed concurrently.
         try {
             return block(this.uniffiClonePointer())
@@ -5481,9 +4984,7 @@ open class Collection :
 
     // Use a static inner class instead of a closure so as not to accidentally
     // capture `this` as part of the cleanable's action.
-    private class UniffiCleanAction(
-        private val pointer: Pointer?,
-    ) : Runnable {
+    private class UniffiCleanAction(private val pointer: Pointer?) : Runnable {
         override fun run() {
             pointer?.let { ptr ->
                 uniffiRustCall { status ->
@@ -5493,128 +4994,124 @@ open class Collection :
         }
     }
 
-    fun uniffiClonePointer(): Pointer =
-        uniffiRustCall { status ->
+    fun uniffiClonePointer(): Pointer {
+        return uniffiRustCall() { status ->
             UniffiLib.INSTANCE.uniffi_iroh_fn_clone_collection(pointer!!, status)
-        }
-
-    /**
-     * Returns a [`Link`] (the name and the hash), for each blob in the collection.
-     */
-    @Throws(
-        IrohException::class,
-        )
-    override fun `blobs`(): List<LinkAndName> =
-        FfiConverterSequenceTypeLinkAndName.lift(
-            callWithPointer {
-                uniffiRustCallWithError(IrohException) { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_collection_blobs(
-                        it,
-                        _status,
-                    )
-                }
-            },
-        )
-
-    /**
-     * Check if the collection is empty
-     */
-    @Throws(
-        IrohException::class,
-        )
-    override fun `isEmpty`(): kotlin.Boolean =
-        FfiConverterBoolean.lift(
-            callWithPointer {
-                uniffiRustCallWithError(IrohException) { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_collection_is_empty(
-                        it,
-                        _status,
-                    )
-                }
-            },
-        )
-
-    /**
-     * Returns the number of blobs in this collection
-     */
-    @Throws(
-        IrohException::class,
-        )
-    override fun `len`(): kotlin.ULong =
-        FfiConverterULong.lift(
-            callWithPointer {
-                uniffiRustCallWithError(IrohException) { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_collection_len(
-                        it,
-                        _status,
-                    )
-                }
-            },
-        )
-
-    /**
-     * Get the links to the blobs in this collection
-     */
-    @Throws(
-        IrohException::class,
-        )
-    override fun `links`(): List<Hash> =
-        FfiConverterSequenceTypeHash.lift(
-            callWithPointer {
-                uniffiRustCallWithError(IrohException) { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_collection_links(
-                        it,
-                        _status,
-                    )
-                }
-            },
-        )
-
-    /**
-     * Get the names of the blobs in this collection
-     */
-    @Throws(
-        IrohException::class,
-        )
-    override fun `names`(): List<kotlin.String> =
-        FfiConverterSequenceString.lift(
-            callWithPointer {
-                uniffiRustCallWithError(IrohException) { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_collection_names(
-                        it,
-                        _status,
-                    )
-                }
-            },
-        )
-
-    /**
-     * Add the given blob to the collection
-     */
-    @Throws(
-        IrohException::class,
-        )
-    override fun `push`(
-        `name`: kotlin.String,
-        `hash`: Hash,
-    ) = callWithPointer {
-        uniffiRustCallWithError(IrohException) { _status ->
-            UniffiLib.INSTANCE.uniffi_iroh_fn_method_collection_push(
-                it,
-                FfiConverterString.lower(`name`),
-                FfiConverterTypeHash.lower(`hash`),
-                _status,
-            )
         }
     }
 
+    
+    /**
+     * Returns a [`Link`] (the name and the hash), for each blob in the collection.
+     */
+    @Throws(IrohException::class)override fun `blobs`(): List<LinkAndName> {
+            return FfiConverterSequenceTypeLinkAndName.lift(
+    callWithPointer {
+    uniffiRustCallWithError(IrohException) { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_collection_blobs(
+        it, _status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
+     * Check if the collection is empty
+     */
+    @Throws(IrohException::class)override fun `isEmpty`(): kotlin.Boolean {
+            return FfiConverterBoolean.lift(
+    callWithPointer {
+    uniffiRustCallWithError(IrohException) { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_collection_is_empty(
+        it, _status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
+     * Returns the number of blobs in this collection
+     */
+    @Throws(IrohException::class)override fun `len`(): kotlin.ULong {
+            return FfiConverterULong.lift(
+    callWithPointer {
+    uniffiRustCallWithError(IrohException) { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_collection_len(
+        it, _status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
+     * Get the links to the blobs in this collection
+     */
+    @Throws(IrohException::class)override fun `links`(): List<Hash> {
+            return FfiConverterSequenceTypeHash.lift(
+    callWithPointer {
+    uniffiRustCallWithError(IrohException) { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_collection_links(
+        it, _status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
+     * Get the names of the blobs in this collection
+     */
+    @Throws(IrohException::class)override fun `names`(): List<kotlin.String> {
+            return FfiConverterSequenceString.lift(
+    callWithPointer {
+    uniffiRustCallWithError(IrohException) { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_collection_names(
+        it, _status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
+     * Add the given blob to the collection
+     */
+    @Throws(IrohException::class)override fun `push`(`name`: kotlin.String, `hash`: Hash)
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(IrohException) { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_collection_push(
+        it, FfiConverterString.lower(`name`),FfiConverterTypeHash.lower(`hash`),_status)
+}
+    }
+    
+    
+
+    
+
+    
+    
     companion object
+    
 }
 
-public object FfiConverterTypeCollection : FfiConverter<Collection, Pointer> {
-    override fun lower(value: Collection): Pointer = value.uniffiClonePointer()
+public object FfiConverterTypeCollection: FfiConverter<Collection, Pointer> {
 
-    override fun lift(value: Pointer): Collection = Collection(value)
+    override fun lower(value: Collection): Pointer {
+        return value.uniffiClonePointer()
+    }
+
+    override fun lift(value: Pointer): Collection {
+        return Collection(value)
+    }
 
     override fun read(buf: ByteBuffer): Collection {
         // The Rust code always writes pointers as 8 bytes, and will
@@ -5624,15 +5121,13 @@ public object FfiConverterTypeCollection : FfiConverter<Collection, Pointer> {
 
     override fun allocationSize(value: Collection) = 8UL
 
-    override fun write(
-        value: Collection,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: Collection, buf: ByteBuffer) {
         // The Rust code always expects pointers written as 8 bytes,
         // and will fail to compile if they don't fit.
         buf.putLong(Pointer.nativeValue(lower(value)))
     }
 }
+
 
 // This template implements a class for working with a Rust struct via a Pointer/Arc<T>
 // to the live Rust struct on the other side of the FFI.
@@ -5731,40 +5226,40 @@ public object FfiConverterTypeCollection : FfiConverter<Collection, Pointer> {
 // [1] https://stackoverflow.com/questions/24376768/can-java-finalize-an-object-when-it-is-still-in-scope/24380219
 //
 
+
 /**
  * The type of connection we have to the node
  */
 public interface ConnectionTypeInterface {
+    
     /**
      * Return the socket address if this is a direct connection
      */
     fun `asDirect`(): kotlin.String
-
+    
     /**
      * Return the socket address and relay url if this is a mixed connection
      */
     fun `asMixed`(): ConnectionTypeMixed
-
+    
     /**
      * Return the relay url if this is a relay connection
      */
     fun `asRelay`(): kotlin.String
-
+    
     /**
      * Whether connection is direct, relay, mixed, or none
      */
     fun `type`(): ConnType
-
+    
     companion object
 }
 
 /**
  * The type of connection we have to the node
  */
-open class ConnectionType :
-    Disposable,
-    AutoCloseable,
-    ConnectionTypeInterface {
+open class ConnectionType: Disposable, AutoCloseable, ConnectionTypeInterface {
+
     constructor(pointer: Pointer) {
         this.pointer = pointer
         this.cleanable = UniffiLib.CLEANER.register(this, UniffiCleanAction(pointer))
@@ -5814,7 +5309,7 @@ open class ConnectionType :
             if (c == Long.MAX_VALUE) {
                 throw IllegalStateException("${this.javaClass.simpleName} call counter would overflow")
             }
-        } while (!this.callCounter.compareAndSet(c, c + 1L))
+        } while (! this.callCounter.compareAndSet(c, c + 1L))
         // Now we can safely do the method call without the pointer being freed concurrently.
         try {
             return block(this.uniffiClonePointer())
@@ -5828,9 +5323,7 @@ open class ConnectionType :
 
     // Use a static inner class instead of a closure so as not to accidentally
     // capture `this` as part of the cleanable's action.
-    private class UniffiCleanAction(
-        private val pointer: Pointer?,
-    ) : Runnable {
+    private class UniffiCleanAction(private val pointer: Pointer?) : Runnable {
         override fun run() {
             pointer?.let { ptr ->
                 uniffiRustCall { status ->
@@ -5840,78 +5333,89 @@ open class ConnectionType :
         }
     }
 
-    fun uniffiClonePointer(): Pointer =
-        uniffiRustCall { status ->
+    fun uniffiClonePointer(): Pointer {
+        return uniffiRustCall() { status ->
             UniffiLib.INSTANCE.uniffi_iroh_fn_clone_connectiontype(pointer!!, status)
         }
+    }
 
+    
     /**
      * Return the socket address if this is a direct connection
-     */
-    override fun `asDirect`(): kotlin.String =
-        FfiConverterString.lift(
-            callWithPointer {
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_connectiontype_as_direct(
-                        it,
-                        _status,
-                    )
-                }
-            },
-        )
+     */override fun `asDirect`(): kotlin.String {
+            return FfiConverterString.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_connectiontype_as_direct(
+        it, _status)
+}
+    }
+    )
+    }
+    
 
+    
     /**
      * Return the socket address and relay url if this is a mixed connection
-     */
-    override fun `asMixed`(): ConnectionTypeMixed =
-        FfiConverterTypeConnectionTypeMixed.lift(
-            callWithPointer {
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_connectiontype_as_mixed(
-                        it,
-                        _status,
-                    )
-                }
-            },
-        )
+     */override fun `asMixed`(): ConnectionTypeMixed {
+            return FfiConverterTypeConnectionTypeMixed.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_connectiontype_as_mixed(
+        it, _status)
+}
+    }
+    )
+    }
+    
 
+    
     /**
      * Return the relay url if this is a relay connection
-     */
-    override fun `asRelay`(): kotlin.String =
-        FfiConverterString.lift(
-            callWithPointer {
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_connectiontype_as_relay(
-                        it,
-                        _status,
-                    )
-                }
-            },
-        )
+     */override fun `asRelay`(): kotlin.String {
+            return FfiConverterString.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_connectiontype_as_relay(
+        it, _status)
+}
+    }
+    )
+    }
+    
 
+    
     /**
      * Whether connection is direct, relay, mixed, or none
-     */
-    override fun `type`(): ConnType =
-        FfiConverterTypeConnType.lift(
-            callWithPointer {
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_connectiontype_type(
-                        it,
-                        _status,
-                    )
-                }
-            },
-        )
+     */override fun `type`(): ConnType {
+            return FfiConverterTypeConnType.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_connectiontype_type(
+        it, _status)
+}
+    }
+    )
+    }
+    
 
+    
+
+    
+    
     companion object
+    
 }
 
-public object FfiConverterTypeConnectionType : FfiConverter<ConnectionType, Pointer> {
-    override fun lower(value: ConnectionType): Pointer = value.uniffiClonePointer()
+public object FfiConverterTypeConnectionType: FfiConverter<ConnectionType, Pointer> {
 
-    override fun lift(value: Pointer): ConnectionType = ConnectionType(value)
+    override fun lower(value: ConnectionType): Pointer {
+        return value.uniffiClonePointer()
+    }
+
+    override fun lift(value: Pointer): ConnectionType {
+        return ConnectionType(value)
+    }
 
     override fun read(buf: ByteBuffer): ConnectionType {
         // The Rust code always writes pointers as 8 bytes, and will
@@ -5921,15 +5425,13 @@ public object FfiConverterTypeConnectionType : FfiConverter<ConnectionType, Poin
 
     override fun allocationSize(value: ConnectionType) = 8UL
 
-    override fun write(
-        value: ConnectionType,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: ConnectionType, buf: ByteBuffer) {
         // The Rust code always expects pointers written as 8 bytes,
         // and will fail to compile if they don't fit.
         buf.putLong(Pointer.nativeValue(lower(value)))
     }
 }
+
 
 // This template implements a class for working with a Rust struct via a Pointer/Arc<T>
 // to the live Rust struct on the other side of the FFI.
@@ -6028,40 +5530,40 @@ public object FfiConverterTypeConnectionType : FfiConverter<ConnectionType, Poin
 // [1] https://stackoverflow.com/questions/24376768/can-java-finalize-an-object-when-it-is-still-in-scope/24380219
 //
 
+
 /**
  * Information about a direct address.
  */
 public interface DirectAddrInfoInterface {
+    
     /**
      * Get the reported address
      */
     fun `addr`(): kotlin.String
-
+    
     /**
      * Get the last control message received by this node
      */
     fun `lastControl`(): LatencyAndControlMsg?
-
+    
     /**
      * Get how long ago the last payload message was received for this node
      */
     fun `lastPayload`(): java.time.Duration?
-
+    
     /**
      * Get the reported latency, if it exists
      */
     fun `latency`(): java.time.Duration?
-
+    
     companion object
 }
 
 /**
  * Information about a direct address.
  */
-open class DirectAddrInfo :
-    Disposable,
-    AutoCloseable,
-    DirectAddrInfoInterface {
+open class DirectAddrInfo: Disposable, AutoCloseable, DirectAddrInfoInterface {
+
     constructor(pointer: Pointer) {
         this.pointer = pointer
         this.cleanable = UniffiLib.CLEANER.register(this, UniffiCleanAction(pointer))
@@ -6111,7 +5613,7 @@ open class DirectAddrInfo :
             if (c == Long.MAX_VALUE) {
                 throw IllegalStateException("${this.javaClass.simpleName} call counter would overflow")
             }
-        } while (!this.callCounter.compareAndSet(c, c + 1L))
+        } while (! this.callCounter.compareAndSet(c, c + 1L))
         // Now we can safely do the method call without the pointer being freed concurrently.
         try {
             return block(this.uniffiClonePointer())
@@ -6125,9 +5627,7 @@ open class DirectAddrInfo :
 
     // Use a static inner class instead of a closure so as not to accidentally
     // capture `this` as part of the cleanable's action.
-    private class UniffiCleanAction(
-        private val pointer: Pointer?,
-    ) : Runnable {
+    private class UniffiCleanAction(private val pointer: Pointer?) : Runnable {
         override fun run() {
             pointer?.let { ptr ->
                 uniffiRustCall { status ->
@@ -6137,78 +5637,89 @@ open class DirectAddrInfo :
         }
     }
 
-    fun uniffiClonePointer(): Pointer =
-        uniffiRustCall { status ->
+    fun uniffiClonePointer(): Pointer {
+        return uniffiRustCall() { status ->
             UniffiLib.INSTANCE.uniffi_iroh_fn_clone_directaddrinfo(pointer!!, status)
         }
+    }
 
+    
     /**
      * Get the reported address
-     */
-    override fun `addr`(): kotlin.String =
-        FfiConverterString.lift(
-            callWithPointer {
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_directaddrinfo_addr(
-                        it,
-                        _status,
-                    )
-                }
-            },
-        )
+     */override fun `addr`(): kotlin.String {
+            return FfiConverterString.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_directaddrinfo_addr(
+        it, _status)
+}
+    }
+    )
+    }
+    
 
+    
     /**
      * Get the last control message received by this node
-     */
-    override fun `lastControl`(): LatencyAndControlMsg? =
-        FfiConverterOptionalTypeLatencyAndControlMsg.lift(
-            callWithPointer {
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_directaddrinfo_last_control(
-                        it,
-                        _status,
-                    )
-                }
-            },
-        )
+     */override fun `lastControl`(): LatencyAndControlMsg? {
+            return FfiConverterOptionalTypeLatencyAndControlMsg.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_directaddrinfo_last_control(
+        it, _status)
+}
+    }
+    )
+    }
+    
 
+    
     /**
      * Get how long ago the last payload message was received for this node
-     */
-    override fun `lastPayload`(): java.time.Duration? =
-        FfiConverterOptionalDuration.lift(
-            callWithPointer {
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_directaddrinfo_last_payload(
-                        it,
-                        _status,
-                    )
-                }
-            },
-        )
+     */override fun `lastPayload`(): java.time.Duration? {
+            return FfiConverterOptionalDuration.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_directaddrinfo_last_payload(
+        it, _status)
+}
+    }
+    )
+    }
+    
 
+    
     /**
      * Get the reported latency, if it exists
-     */
-    override fun `latency`(): java.time.Duration? =
-        FfiConverterOptionalDuration.lift(
-            callWithPointer {
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_directaddrinfo_latency(
-                        it,
-                        _status,
-                    )
-                }
-            },
-        )
+     */override fun `latency`(): java.time.Duration? {
+            return FfiConverterOptionalDuration.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_directaddrinfo_latency(
+        it, _status)
+}
+    }
+    )
+    }
+    
 
+    
+
+    
+    
     companion object
+    
 }
 
-public object FfiConverterTypeDirectAddrInfo : FfiConverter<DirectAddrInfo, Pointer> {
-    override fun lower(value: DirectAddrInfo): Pointer = value.uniffiClonePointer()
+public object FfiConverterTypeDirectAddrInfo: FfiConverter<DirectAddrInfo, Pointer> {
 
-    override fun lift(value: Pointer): DirectAddrInfo = DirectAddrInfo(value)
+    override fun lower(value: DirectAddrInfo): Pointer {
+        return value.uniffiClonePointer()
+    }
+
+    override fun lift(value: Pointer): DirectAddrInfo {
+        return DirectAddrInfo(value)
+    }
 
     override fun read(buf: ByteBuffer): DirectAddrInfo {
         // The Rust code always writes pointers as 8 bytes, and will
@@ -6218,15 +5729,13 @@ public object FfiConverterTypeDirectAddrInfo : FfiConverter<DirectAddrInfo, Poin
 
     override fun allocationSize(value: DirectAddrInfo) = 8UL
 
-    override fun write(
-        value: DirectAddrInfo,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: DirectAddrInfo, buf: ByteBuffer) {
         // The Rust code always expects pointers written as 8 bytes,
         // and will fail to compile if they don't fit.
         buf.putLong(Pointer.nativeValue(lower(value)))
     }
 }
+
 
 // This template implements a class for working with a Rust struct via a Pointer/Arc<T>
 // to the live Rust struct on the other side of the FFI.
@@ -6325,15 +5834,17 @@ public object FfiConverterTypeDirectAddrInfo : FfiConverter<DirectAddrInfo, Poin
 // [1] https://stackoverflow.com/questions/24376768/can-java-finalize-an-object-when-it-is-still-in-scope/24380219
 //
 
+
 /**
  * A representation of a mutable, synchronizable key-value store.
  */
 public interface DocInterface {
+    
     /**
      * Close the document.
      */
     fun `closeMe`()
-
+    
     /**
      * Delete entries that match the given `author` and key `prefix`.
      *
@@ -6342,36 +5853,25 @@ public interface DocInterface {
      *
      * Returns the number of entries deleted.
      */
-    fun `del`(
-        `authorId`: AuthorId,
-        `prefix`: kotlin.ByteArray,
-    ): kotlin.ULong
-
+    fun `del`(`authorId`: AuthorId, `prefix`: kotlin.ByteArray): kotlin.ULong
+    
     /**
      * Export an entry as a file to a given absolute path
      */
-    fun `exportFile`(
-        `entry`: Entry,
-        `path`: kotlin.String,
-        `cb`: DocExportFileCallback?,
-    )
-
+    fun `exportFile`(`entry`: Entry, `path`: kotlin.String, `cb`: DocExportFileCallback?)
+    
     /**
      * Get the download policy for this document
      */
     fun `getDownloadPolicy`(): DownloadPolicy
-
+    
     /**
      * Get an entry for a key and author.
      *
      * Optionally also get the entry if it is empty (i.e. a deletion marker)
      */
-    fun `getExact`(
-        `author`: AuthorId,
-        `key`: kotlin.ByteArray,
-        `includeEmpty`: kotlin.Boolean,
-    ): Entry?
-
+    fun `getExact`(`author`: AuthorId, `key`: kotlin.ByteArray, `includeEmpty`: kotlin.Boolean): Entry?
+    
     /**
      * Get entries.
      *
@@ -6379,90 +5879,70 @@ public interface DocInterface {
      * Please file an [issue](https://github.com/n0-computer/iroh-ffi/issues/new) if you run into this issue
      */
     fun `getMany`(`query`: Query): List<Entry>
-
+    
     /**
      * Get the latest entry for a key and author.
      */
     fun `getOne`(`query`: Query): Entry?
-
+    
     /**
      * Get the document id of this doc.
      */
     fun `id`(): kotlin.String
-
+    
     /**
      * Add an entry from an absolute file path
      */
-    fun `importFile`(
-        `author`: AuthorId,
-        `key`: kotlin.ByteArray,
-        `path`: kotlin.String,
-        `inPlace`: kotlin.Boolean,
-        `cb`: DocImportFileCallback?,
-    )
-
+    fun `importFile`(`author`: AuthorId, `key`: kotlin.ByteArray, `path`: kotlin.String, `inPlace`: kotlin.Boolean, `cb`: DocImportFileCallback?)
+    
     /**
      * Stop the live sync for this document.
      */
     fun `leave`()
-
+    
     /**
      * Set the content of a key to a byte array.
      */
-    fun `setBytes`(
-        `author`: AuthorId,
-        `key`: kotlin.ByteArray,
-        `value`: kotlin.ByteArray,
-    ): Hash
-
+    fun `setBytes`(`author`: AuthorId, `key`: kotlin.ByteArray, `value`: kotlin.ByteArray): Hash
+    
     /**
      * Set the download policy for this document
      */
     fun `setDownloadPolicy`(`policy`: DownloadPolicy)
-
+    
     /**
      * Set an entries on the doc via its key, hash, and size.
      */
-    fun `setHash`(
-        `author`: AuthorId,
-        `key`: kotlin.ByteArray,
-        `hash`: Hash,
-        `size`: kotlin.ULong,
-    )
-
+    fun `setHash`(`author`: AuthorId, `key`: kotlin.ByteArray, `hash`: Hash, `size`: kotlin.ULong)
+    
     /**
      * Share this document with peers over a ticket.
      */
-    fun `share`(
-        `mode`: ShareMode,
-        `addrOptions`: AddrInfoOptions,
-    ): kotlin.String
-
+    fun `share`(`mode`: ShareMode, `addrOptions`: AddrInfoOptions): kotlin.String
+    
     /**
      * Start to sync this document with a list of peers.
      */
     fun `startSync`(`peers`: List<NodeAddr>)
-
+    
     /**
      * Get status info for this document
      */
     fun `status`(): OpenState
-
+    
     /**
      * Subscribe to events for this document.
      */
     fun `subscribe`(`cb`: SubscribeCallback)
-
+    
     companion object
 }
 
 /**
  * A representation of a mutable, synchronizable key-value store.
  */
-open class Doc :
-    Disposable,
-    AutoCloseable,
-    DocInterface {
+open class Doc: Disposable, AutoCloseable, DocInterface {
+
     constructor(pointer: Pointer) {
         this.pointer = pointer
         this.cleanable = UniffiLib.CLEANER.register(this, UniffiCleanAction(pointer))
@@ -6512,7 +5992,7 @@ open class Doc :
             if (c == Long.MAX_VALUE) {
                 throw IllegalStateException("${this.javaClass.simpleName} call counter would overflow")
             }
-        } while (!this.callCounter.compareAndSet(c, c + 1L))
+        } while (! this.callCounter.compareAndSet(c, c + 1L))
         // Now we can safely do the method call without the pointer being freed concurrently.
         try {
             return block(this.uniffiClonePointer())
@@ -6526,9 +6006,7 @@ open class Doc :
 
     // Use a static inner class instead of a closure so as not to accidentally
     // capture `this` as part of the cleanable's action.
-    private class UniffiCleanAction(
-        private val pointer: Pointer?,
-    ) : Runnable {
+    private class UniffiCleanAction(private val pointer: Pointer?) : Runnable {
         override fun run() {
             pointer?.let { ptr ->
                 uniffiRustCall { status ->
@@ -6538,27 +6016,28 @@ open class Doc :
         }
     }
 
-    fun uniffiClonePointer(): Pointer =
-        uniffiRustCall { status ->
+    fun uniffiClonePointer(): Pointer {
+        return uniffiRustCall() { status ->
             UniffiLib.INSTANCE.uniffi_iroh_fn_clone_doc(pointer!!, status)
         }
+    }
 
+    
     /**
      * Close the document.
      */
-    @Throws(
-        IrohException::class,
-        )
-    override fun `closeMe`() =
-        callWithPointer {
-            uniffiRustCallWithError(IrohException) { _status ->
-                UniffiLib.INSTANCE.uniffi_iroh_fn_method_doc_close_me(
-                    it,
-                    _status,
-                )
-            }
-        }
+    @Throws(IrohException::class)override fun `closeMe`()
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(IrohException) { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_doc_close_me(
+        it, _status)
+}
+    }
+    
+    
 
+    
     /**
      * Delete entries that match the given `author` and key `prefix`.
      *
@@ -6567,339 +6046,272 @@ open class Doc :
      *
      * Returns the number of entries deleted.
      */
-    @Throws(
-        IrohException::class,
-        )
-    override fun `del`(
-        `authorId`: AuthorId,
-        `prefix`: kotlin.ByteArray,
-    ): kotlin.ULong =
-        FfiConverterULong.lift(
-            callWithPointer {
-                uniffiRustCallWithError(IrohException) { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_doc_del(
-                        it,
-                        FfiConverterTypeAuthorId.lower(`authorId`),
-                        FfiConverterByteArray.lower(`prefix`),
-                        _status,
-                    )
-                }
-            },
-        )
+    @Throws(IrohException::class)override fun `del`(`authorId`: AuthorId, `prefix`: kotlin.ByteArray): kotlin.ULong {
+            return FfiConverterULong.lift(
+    callWithPointer {
+    uniffiRustCallWithError(IrohException) { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_doc_del(
+        it, FfiConverterTypeAuthorId.lower(`authorId`),FfiConverterByteArray.lower(`prefix`),_status)
+}
+    }
+    )
+    }
+    
 
+    
     /**
      * Export an entry as a file to a given absolute path
      */
-    @Throws(
-        IrohException::class,
-        )
-    override fun `exportFile`(
-        `entry`: Entry,
-        `path`: kotlin.String,
-        `cb`: DocExportFileCallback?,
-    ) = callWithPointer {
-        uniffiRustCallWithError(IrohException) { _status ->
-            UniffiLib.INSTANCE.uniffi_iroh_fn_method_doc_export_file(
-                it,
-                FfiConverterTypeEntry.lower(`entry`),
-                FfiConverterString.lower(`path`),
-                FfiConverterOptionalTypeDocExportFileCallback.lower(`cb`),
-                _status,
-            )
-        }
+    @Throws(IrohException::class)override fun `exportFile`(`entry`: Entry, `path`: kotlin.String, `cb`: DocExportFileCallback?)
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(IrohException) { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_doc_export_file(
+        it, FfiConverterTypeEntry.lower(`entry`),FfiConverterString.lower(`path`),FfiConverterOptionalTypeDocExportFileCallback.lower(`cb`),_status)
+}
     }
+    
+    
 
+    
     /**
      * Get the download policy for this document
      */
-    @Throws(
-        IrohException::class,
-        )
-    override fun `getDownloadPolicy`(): DownloadPolicy =
-        FfiConverterTypeDownloadPolicy.lift(
-            callWithPointer {
-                uniffiRustCallWithError(IrohException) { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_doc_get_download_policy(
-                        it,
-                        _status,
-                    )
-                }
-            },
-        )
+    @Throws(IrohException::class)override fun `getDownloadPolicy`(): DownloadPolicy {
+            return FfiConverterTypeDownloadPolicy.lift(
+    callWithPointer {
+    uniffiRustCallWithError(IrohException) { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_doc_get_download_policy(
+        it, _status)
+}
+    }
+    )
+    }
+    
 
+    
     /**
      * Get an entry for a key and author.
      *
      * Optionally also get the entry if it is empty (i.e. a deletion marker)
      */
-    @Throws(
-        IrohException::class,
-        )
-    override fun `getExact`(
-        `author`: AuthorId,
-        `key`: kotlin.ByteArray,
-        `includeEmpty`: kotlin.Boolean,
-    ): Entry? =
-        FfiConverterOptionalTypeEntry.lift(
-            callWithPointer {
-                uniffiRustCallWithError(IrohException) { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_doc_get_exact(
-                        it,
-                        FfiConverterTypeAuthorId.lower(`author`),
-                        FfiConverterByteArray.lower(`key`),
-                        FfiConverterBoolean.lower(`includeEmpty`),
-                        _status,
-                    )
-                }
-            },
-        )
+    @Throws(IrohException::class)override fun `getExact`(`author`: AuthorId, `key`: kotlin.ByteArray, `includeEmpty`: kotlin.Boolean): Entry? {
+            return FfiConverterOptionalTypeEntry.lift(
+    callWithPointer {
+    uniffiRustCallWithError(IrohException) { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_doc_get_exact(
+        it, FfiConverterTypeAuthorId.lower(`author`),FfiConverterByteArray.lower(`key`),FfiConverterBoolean.lower(`includeEmpty`),_status)
+}
+    }
+    )
+    }
+    
 
+    
     /**
      * Get entries.
      *
      * Note: this allocates for each `Entry`, if you have many `Entry`s this may be a prohibitively large list.
      * Please file an [issue](https://github.com/n0-computer/iroh-ffi/issues/new) if you run into this issue
      */
-    @Throws(
-        IrohException::class,
-        )
-    override fun `getMany`(`query`: Query): List<Entry> =
-        FfiConverterSequenceTypeEntry.lift(
-            callWithPointer {
-                uniffiRustCallWithError(IrohException) { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_doc_get_many(
-                        it,
-                        FfiConverterTypeQuery.lower(`query`),
-                        _status,
-                    )
-                }
-            },
-        )
+    @Throws(IrohException::class)override fun `getMany`(`query`: Query): List<Entry> {
+            return FfiConverterSequenceTypeEntry.lift(
+    callWithPointer {
+    uniffiRustCallWithError(IrohException) { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_doc_get_many(
+        it, FfiConverterTypeQuery.lower(`query`),_status)
+}
+    }
+    )
+    }
+    
 
+    
     /**
      * Get the latest entry for a key and author.
      */
-    @Throws(
-        IrohException::class,
-        )
-    override fun `getOne`(`query`: Query): Entry? =
-        FfiConverterOptionalTypeEntry.lift(
-            callWithPointer {
-                uniffiRustCallWithError(IrohException) { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_doc_get_one(
-                        it,
-                        FfiConverterTypeQuery.lower(`query`),
-                        _status,
-                    )
-                }
-            },
-        )
+    @Throws(IrohException::class)override fun `getOne`(`query`: Query): Entry? {
+            return FfiConverterOptionalTypeEntry.lift(
+    callWithPointer {
+    uniffiRustCallWithError(IrohException) { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_doc_get_one(
+        it, FfiConverterTypeQuery.lower(`query`),_status)
+}
+    }
+    )
+    }
+    
 
+    
     /**
      * Get the document id of this doc.
-     */
-    override fun `id`(): kotlin.String =
-        FfiConverterString.lift(
-            callWithPointer {
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_doc_id(
-                        it,
-                        _status,
-                    )
-                }
-            },
-        )
+     */override fun `id`(): kotlin.String {
+            return FfiConverterString.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_doc_id(
+        it, _status)
+}
+    }
+    )
+    }
+    
 
+    
     /**
      * Add an entry from an absolute file path
      */
-    @Throws(
-        IrohException::class,
-        )
-    override fun `importFile`(
-        `author`: AuthorId,
-        `key`: kotlin.ByteArray,
-        `path`: kotlin.String,
-        `inPlace`: kotlin.Boolean,
-        `cb`: DocImportFileCallback?,
-    ) = callWithPointer {
-        uniffiRustCallWithError(IrohException) { _status ->
-            UniffiLib.INSTANCE.uniffi_iroh_fn_method_doc_import_file(
-                it,
-                FfiConverterTypeAuthorId.lower(`author`),
-                FfiConverterByteArray.lower(`key`),
-                FfiConverterString.lower(`path`),
-                FfiConverterBoolean.lower(`inPlace`),
-                FfiConverterOptionalTypeDocImportFileCallback.lower(`cb`),
-                _status,
-            )
-        }
+    @Throws(IrohException::class)override fun `importFile`(`author`: AuthorId, `key`: kotlin.ByteArray, `path`: kotlin.String, `inPlace`: kotlin.Boolean, `cb`: DocImportFileCallback?)
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(IrohException) { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_doc_import_file(
+        it, FfiConverterTypeAuthorId.lower(`author`),FfiConverterByteArray.lower(`key`),FfiConverterString.lower(`path`),FfiConverterBoolean.lower(`inPlace`),FfiConverterOptionalTypeDocImportFileCallback.lower(`cb`),_status)
+}
     }
+    
+    
 
+    
     /**
      * Stop the live sync for this document.
      */
-    @Throws(
-        IrohException::class,
-        )
-    override fun `leave`() =
-        callWithPointer {
-            uniffiRustCallWithError(IrohException) { _status ->
-                UniffiLib.INSTANCE.uniffi_iroh_fn_method_doc_leave(
-                    it,
-                    _status,
-                )
-            }
-        }
+    @Throws(IrohException::class)override fun `leave`()
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(IrohException) { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_doc_leave(
+        it, _status)
+}
+    }
+    
+    
 
+    
     /**
      * Set the content of a key to a byte array.
      */
-    @Throws(
-        IrohException::class,
-        )
-    override fun `setBytes`(
-        `author`: AuthorId,
-        `key`: kotlin.ByteArray,
-        `value`: kotlin.ByteArray,
-    ): Hash =
-        FfiConverterTypeHash.lift(
-            callWithPointer {
-                uniffiRustCallWithError(IrohException) { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_doc_set_bytes(
-                        it,
-                        FfiConverterTypeAuthorId.lower(`author`),
-                        FfiConverterByteArray.lower(`key`),
-                        FfiConverterByteArray.lower(`value`),
-                        _status,
-                    )
-                }
-            },
-        )
+    @Throws(IrohException::class)override fun `setBytes`(`author`: AuthorId, `key`: kotlin.ByteArray, `value`: kotlin.ByteArray): Hash {
+            return FfiConverterTypeHash.lift(
+    callWithPointer {
+    uniffiRustCallWithError(IrohException) { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_doc_set_bytes(
+        it, FfiConverterTypeAuthorId.lower(`author`),FfiConverterByteArray.lower(`key`),FfiConverterByteArray.lower(`value`),_status)
+}
+    }
+    )
+    }
+    
 
+    
     /**
      * Set the download policy for this document
      */
-    @Throws(
-        IrohException::class,
-        )
-    override fun `setDownloadPolicy`(`policy`: DownloadPolicy) =
-        callWithPointer {
-            uniffiRustCallWithError(IrohException) { _status ->
-                UniffiLib.INSTANCE.uniffi_iroh_fn_method_doc_set_download_policy(
-                    it,
-                    FfiConverterTypeDownloadPolicy.lower(`policy`),
-                    _status,
-                )
-            }
-        }
+    @Throws(IrohException::class)override fun `setDownloadPolicy`(`policy`: DownloadPolicy)
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(IrohException) { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_doc_set_download_policy(
+        it, FfiConverterTypeDownloadPolicy.lower(`policy`),_status)
+}
+    }
+    
+    
 
+    
     /**
      * Set an entries on the doc via its key, hash, and size.
      */
-    @Throws(
-        IrohException::class,
-        )
-    override fun `setHash`(
-        `author`: AuthorId,
-        `key`: kotlin.ByteArray,
-        `hash`: Hash,
-        `size`: kotlin.ULong,
-    ) = callWithPointer {
-        uniffiRustCallWithError(IrohException) { _status ->
-            UniffiLib.INSTANCE.uniffi_iroh_fn_method_doc_set_hash(
-                it,
-                FfiConverterTypeAuthorId.lower(`author`),
-                FfiConverterByteArray.lower(`key`),
-                FfiConverterTypeHash.lower(`hash`),
-                FfiConverterULong.lower(`size`),
-                _status,
-            )
-        }
+    @Throws(IrohException::class)override fun `setHash`(`author`: AuthorId, `key`: kotlin.ByteArray, `hash`: Hash, `size`: kotlin.ULong)
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(IrohException) { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_doc_set_hash(
+        it, FfiConverterTypeAuthorId.lower(`author`),FfiConverterByteArray.lower(`key`),FfiConverterTypeHash.lower(`hash`),FfiConverterULong.lower(`size`),_status)
+}
     }
+    
+    
 
+    
     /**
      * Share this document with peers over a ticket.
      */
-    @Throws(
-        IrohException::class,
-        )
-    override fun `share`(
-        `mode`: ShareMode,
-        `addrOptions`: AddrInfoOptions,
-    ): kotlin.String =
-        FfiConverterString.lift(
-            callWithPointer {
-                uniffiRustCallWithError(IrohException) { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_doc_share(
-                        it,
-                        FfiConverterTypeShareMode.lower(`mode`),
-                        FfiConverterTypeAddrInfoOptions.lower(`addrOptions`),
-                        _status,
-                    )
-                }
-            },
-        )
+    @Throws(IrohException::class)override fun `share`(`mode`: ShareMode, `addrOptions`: AddrInfoOptions): kotlin.String {
+            return FfiConverterString.lift(
+    callWithPointer {
+    uniffiRustCallWithError(IrohException) { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_doc_share(
+        it, FfiConverterTypeShareMode.lower(`mode`),FfiConverterTypeAddrInfoOptions.lower(`addrOptions`),_status)
+}
+    }
+    )
+    }
+    
 
+    
     /**
      * Start to sync this document with a list of peers.
      */
-    @Throws(
-        IrohException::class,
-        )
-    override fun `startSync`(`peers`: List<NodeAddr>) =
-        callWithPointer {
-            uniffiRustCallWithError(IrohException) { _status ->
-                UniffiLib.INSTANCE.uniffi_iroh_fn_method_doc_start_sync(
-                    it,
-                    FfiConverterSequenceTypeNodeAddr.lower(`peers`),
-                    _status,
-                )
-            }
-        }
+    @Throws(IrohException::class)override fun `startSync`(`peers`: List<NodeAddr>)
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(IrohException) { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_doc_start_sync(
+        it, FfiConverterSequenceTypeNodeAddr.lower(`peers`),_status)
+}
+    }
+    
+    
 
+    
     /**
      * Get status info for this document
      */
-    @Throws(
-        IrohException::class,
-        )
-    override fun `status`(): OpenState =
-        FfiConverterTypeOpenState.lift(
-            callWithPointer {
-                uniffiRustCallWithError(IrohException) { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_doc_status(
-                        it,
-                        _status,
-                    )
-                }
-            },
-        )
+    @Throws(IrohException::class)override fun `status`(): OpenState {
+            return FfiConverterTypeOpenState.lift(
+    callWithPointer {
+    uniffiRustCallWithError(IrohException) { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_doc_status(
+        it, _status)
+}
+    }
+    )
+    }
+    
 
+    
     /**
      * Subscribe to events for this document.
      */
-    @Throws(
-        IrohException::class,
-        )
-    override fun `subscribe`(`cb`: SubscribeCallback) =
-        callWithPointer {
-            uniffiRustCallWithError(IrohException) { _status ->
-                UniffiLib.INSTANCE.uniffi_iroh_fn_method_doc_subscribe(
-                    it,
-                    FfiConverterTypeSubscribeCallback.lower(`cb`),
-                    _status,
-                )
-            }
-        }
+    @Throws(IrohException::class)override fun `subscribe`(`cb`: SubscribeCallback)
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(IrohException) { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_doc_subscribe(
+        it, FfiConverterTypeSubscribeCallback.lower(`cb`),_status)
+}
+    }
+    
+    
 
+    
+
+    
+    
     companion object
+    
 }
 
-public object FfiConverterTypeDoc : FfiConverter<Doc, Pointer> {
-    override fun lower(value: Doc): Pointer = value.uniffiClonePointer()
+public object FfiConverterTypeDoc: FfiConverter<Doc, Pointer> {
 
-    override fun lift(value: Pointer): Doc = Doc(value)
+    override fun lower(value: Doc): Pointer {
+        return value.uniffiClonePointer()
+    }
+
+    override fun lift(value: Pointer): Doc {
+        return Doc(value)
+    }
 
     override fun read(buf: ByteBuffer): Doc {
         // The Rust code always writes pointers as 8 bytes, and will
@@ -6909,15 +6321,13 @@ public object FfiConverterTypeDoc : FfiConverter<Doc, Pointer> {
 
     override fun allocationSize(value: Doc) = 8UL
 
-    override fun write(
-        value: Doc,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: Doc, buf: ByteBuffer) {
         // The Rust code always expects pointers written as 8 bytes,
         // and will fail to compile if they don't fit.
         buf.putLong(Pointer.nativeValue(lower(value)))
     }
 }
+
 
 // This template implements a class for working with a Rust struct via a Pointer/Arc<T>
 // to the live Rust struct on the other side of the FFI.
@@ -7016,14 +6426,16 @@ public object FfiConverterTypeDoc : FfiConverter<Doc, Pointer> {
 // [1] https://stackoverflow.com/questions/24376768/can-java-finalize-an-object-when-it-is-still-in-scope/24380219
 //
 
+
 /**
  * The `progress` method will be called for each `DocExportProgress` event that is
  * emitted during a `doc.export_file()` call. Use the `DocExportProgress.type()`
  * method to check the `DocExportProgressType`
  */
 public interface DocExportFileCallback {
+    
     fun `progress`(`progress`: DocExportProgress)
-
+    
     companion object
 }
 
@@ -7032,10 +6444,8 @@ public interface DocExportFileCallback {
  * emitted during a `doc.export_file()` call. Use the `DocExportProgress.type()`
  * method to check the `DocExportProgressType`
  */
-open class DocExportFileCallbackImpl :
-    Disposable,
-    AutoCloseable,
-    DocExportFileCallback {
+open class DocExportFileCallbackImpl: Disposable, AutoCloseable, DocExportFileCallback {
+
     constructor(pointer: Pointer) {
         this.pointer = pointer
         this.cleanable = UniffiLib.CLEANER.register(this, UniffiCleanAction(pointer))
@@ -7085,7 +6495,7 @@ open class DocExportFileCallbackImpl :
             if (c == Long.MAX_VALUE) {
                 throw IllegalStateException("${this.javaClass.simpleName} call counter would overflow")
             }
-        } while (!this.callCounter.compareAndSet(c, c + 1L))
+        } while (! this.callCounter.compareAndSet(c, c + 1L))
         // Now we can safely do the method call without the pointer being freed concurrently.
         try {
             return block(this.uniffiClonePointer())
@@ -7099,9 +6509,7 @@ open class DocExportFileCallbackImpl :
 
     // Use a static inner class instead of a closure so as not to accidentally
     // capture `this` as part of the cleanable's action.
-    private class UniffiCleanAction(
-        private val pointer: Pointer?,
-    ) : Runnable {
+    private class UniffiCleanAction(private val pointer: Pointer?) : Runnable {
         override fun run() {
             pointer?.let { ptr ->
                 uniffiRustCall { status ->
@@ -7111,63 +6519,63 @@ open class DocExportFileCallbackImpl :
         }
     }
 
-    fun uniffiClonePointer(): Pointer =
-        uniffiRustCall { status ->
+    fun uniffiClonePointer(): Pointer {
+        return uniffiRustCall() { status ->
             UniffiLib.INSTANCE.uniffi_iroh_fn_clone_docexportfilecallback(pointer!!, status)
         }
+    }
 
-    @Throws(
-        CallbackException::class,
-        )
-    override fun `progress`(`progress`: DocExportProgress) =
-        callWithPointer {
-            uniffiRustCallWithError(CallbackException) { _status ->
-                UniffiLib.INSTANCE.uniffi_iroh_fn_method_docexportfilecallback_progress(
-                    it,
-                    FfiConverterTypeDocExportProgress.lower(`progress`),
-                    _status,
-                )
-            }
-        }
-
-    companion object
+    
+    @Throws(CallbackException::class)override fun `progress`(`progress`: DocExportProgress)
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(CallbackException) { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_docexportfilecallback_progress(
+        it, FfiConverterTypeDocExportProgress.lower(`progress`),_status)
 }
+    }
+    
+    
+
+    
+
+    
+    
+    companion object
+    
+}
+
 
 // Put the implementation in an object so we don't pollute the top-level namespace
 internal object uniffiCallbackInterfaceDocExportFileCallback {
-    internal object `progress` : UniffiCallbackInterfaceDocExportFileCallbackMethod0 {
-        override fun callback(
-            `uniffiHandle`: Long,
-            `progress`: Pointer,
-            `uniffiOutReturn`: Pointer,
-            uniffiCallStatus: UniffiRustCallStatus,
-        ) {
+    internal object `progress`: UniffiCallbackInterfaceDocExportFileCallbackMethod0 {
+        override fun callback(`uniffiHandle`: Long,`progress`: Pointer,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,) {
             val uniffiObj = FfiConverterTypeDocExportFileCallback.handleMap.get(uniffiHandle)
-            val makeCall = {  uniffiObj.`progress`(
-                FfiConverterTypeDocExportProgress.lift(`progress`),
-            )
+            val makeCall = { ->
+                uniffiObj.`progress`(
+                    FfiConverterTypeDocExportProgress.lift(`progress`),
+                )
             }
             val writeReturn = { _: Unit -> Unit }
             uniffiTraitInterfaceCallWithError(
                 uniffiCallStatus,
                 makeCall,
                 writeReturn,
-                { e: CallbackException -> FfiConverterTypeCallbackError.lower(e) },
+                { e: CallbackException -> FfiConverterTypeCallbackError.lower(e) }
             )
         }
     }
 
-    internal object uniffiFree : UniffiCallbackInterfaceFree {
+    internal object uniffiFree: UniffiCallbackInterfaceFree {
         override fun callback(handle: Long) {
             FfiConverterTypeDocExportFileCallback.handleMap.remove(handle)
         }
     }
 
-    internal var vtable =
-        UniffiVTableCallbackInterfaceDocExportFileCallback.UniffiByValue(
-            `progress`,
-            uniffiFree,
-        )
+    internal var vtable = UniffiVTableCallbackInterfaceDocExportFileCallback.UniffiByValue(
+        `progress`,
+        uniffiFree,
+    )
 
     // Registers the foreign callback with the Rust side.
     // This method is generated for each callback interface.
@@ -7176,12 +6584,16 @@ internal object uniffiCallbackInterfaceDocExportFileCallback {
     }
 }
 
-public object FfiConverterTypeDocExportFileCallback : FfiConverter<DocExportFileCallback, Pointer> {
+public object FfiConverterTypeDocExportFileCallback: FfiConverter<DocExportFileCallback, Pointer> {
     internal val handleMap = UniffiHandleMap<DocExportFileCallback>()
 
-    override fun lower(value: DocExportFileCallback): Pointer = Pointer(handleMap.insert(value))
+    override fun lower(value: DocExportFileCallback): Pointer {
+        return Pointer(handleMap.insert(value))
+    }
 
-    override fun lift(value: Pointer): DocExportFileCallback = DocExportFileCallbackImpl(value)
+    override fun lift(value: Pointer): DocExportFileCallback {
+        return DocExportFileCallbackImpl(value)
+    }
 
     override fun read(buf: ByteBuffer): DocExportFileCallback {
         // The Rust code always writes pointers as 8 bytes, and will
@@ -7191,15 +6603,13 @@ public object FfiConverterTypeDocExportFileCallback : FfiConverter<DocExportFile
 
     override fun allocationSize(value: DocExportFileCallback) = 8UL
 
-    override fun write(
-        value: DocExportFileCallback,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: DocExportFileCallback, buf: ByteBuffer) {
         // The Rust code always expects pointers written as 8 bytes,
         // and will fail to compile if they don't fit.
         buf.putLong(Pointer.nativeValue(lower(value)))
     }
 }
+
 
 // This template implements a class for working with a Rust struct via a Pointer/Arc<T>
 // to the live Rust struct on the other side of the FFI.
@@ -7298,40 +6708,40 @@ public object FfiConverterTypeDocExportFileCallback : FfiConverter<DocExportFile
 // [1] https://stackoverflow.com/questions/24376768/can-java-finalize-an-object-when-it-is-still-in-scope/24380219
 //
 
+
 /**
  * Progress updates for the doc import file operation.
  */
 public interface DocExportProgressInterface {
+    
     /**
      * Return the `DocExportProgressAbort`
      */
     fun `asAbort`(): DocExportProgressAbort
-
+    
     /**
      * Return the `DocExportProgressFound` event
      */
     fun `asFound`(): DocExportProgressFound
-
+    
     /**
      * Return the `DocExportProgressProgress` event
      */
     fun `asProgress`(): DocExportProgressProgress
-
+    
     /**
      * Get the type of event
      */
     fun `type`(): DocExportProgressType
-
+    
     companion object
 }
 
 /**
  * Progress updates for the doc import file operation.
  */
-open class DocExportProgress :
-    Disposable,
-    AutoCloseable,
-    DocExportProgressInterface {
+open class DocExportProgress: Disposable, AutoCloseable, DocExportProgressInterface {
+
     constructor(pointer: Pointer) {
         this.pointer = pointer
         this.cleanable = UniffiLib.CLEANER.register(this, UniffiCleanAction(pointer))
@@ -7381,7 +6791,7 @@ open class DocExportProgress :
             if (c == Long.MAX_VALUE) {
                 throw IllegalStateException("${this.javaClass.simpleName} call counter would overflow")
             }
-        } while (!this.callCounter.compareAndSet(c, c + 1L))
+        } while (! this.callCounter.compareAndSet(c, c + 1L))
         // Now we can safely do the method call without the pointer being freed concurrently.
         try {
             return block(this.uniffiClonePointer())
@@ -7395,9 +6805,7 @@ open class DocExportProgress :
 
     // Use a static inner class instead of a closure so as not to accidentally
     // capture `this` as part of the cleanable's action.
-    private class UniffiCleanAction(
-        private val pointer: Pointer?,
-    ) : Runnable {
+    private class UniffiCleanAction(private val pointer: Pointer?) : Runnable {
         override fun run() {
             pointer?.let { ptr ->
                 uniffiRustCall { status ->
@@ -7407,78 +6815,89 @@ open class DocExportProgress :
         }
     }
 
-    fun uniffiClonePointer(): Pointer =
-        uniffiRustCall { status ->
+    fun uniffiClonePointer(): Pointer {
+        return uniffiRustCall() { status ->
             UniffiLib.INSTANCE.uniffi_iroh_fn_clone_docexportprogress(pointer!!, status)
         }
+    }
 
+    
     /**
      * Return the `DocExportProgressAbort`
-     */
-    override fun `asAbort`(): DocExportProgressAbort =
-        FfiConverterTypeDocExportProgressAbort.lift(
-            callWithPointer {
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_docexportprogress_as_abort(
-                        it,
-                        _status,
-                    )
-                }
-            },
-        )
+     */override fun `asAbort`(): DocExportProgressAbort {
+            return FfiConverterTypeDocExportProgressAbort.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_docexportprogress_as_abort(
+        it, _status)
+}
+    }
+    )
+    }
+    
 
+    
     /**
      * Return the `DocExportProgressFound` event
-     */
-    override fun `asFound`(): DocExportProgressFound =
-        FfiConverterTypeDocExportProgressFound.lift(
-            callWithPointer {
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_docexportprogress_as_found(
-                        it,
-                        _status,
-                    )
-                }
-            },
-        )
+     */override fun `asFound`(): DocExportProgressFound {
+            return FfiConverterTypeDocExportProgressFound.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_docexportprogress_as_found(
+        it, _status)
+}
+    }
+    )
+    }
+    
 
+    
     /**
      * Return the `DocExportProgressProgress` event
-     */
-    override fun `asProgress`(): DocExportProgressProgress =
-        FfiConverterTypeDocExportProgressProgress.lift(
-            callWithPointer {
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_docexportprogress_as_progress(
-                        it,
-                        _status,
-                    )
-                }
-            },
-        )
+     */override fun `asProgress`(): DocExportProgressProgress {
+            return FfiConverterTypeDocExportProgressProgress.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_docexportprogress_as_progress(
+        it, _status)
+}
+    }
+    )
+    }
+    
 
+    
     /**
      * Get the type of event
-     */
-    override fun `type`(): DocExportProgressType =
-        FfiConverterTypeDocExportProgressType.lift(
-            callWithPointer {
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_docexportprogress_type(
-                        it,
-                        _status,
-                    )
-                }
-            },
-        )
+     */override fun `type`(): DocExportProgressType {
+            return FfiConverterTypeDocExportProgressType.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_docexportprogress_type(
+        it, _status)
+}
+    }
+    )
+    }
+    
 
+    
+
+    
+    
     companion object
+    
 }
 
-public object FfiConverterTypeDocExportProgress : FfiConverter<DocExportProgress, Pointer> {
-    override fun lower(value: DocExportProgress): Pointer = value.uniffiClonePointer()
+public object FfiConverterTypeDocExportProgress: FfiConverter<DocExportProgress, Pointer> {
 
-    override fun lift(value: Pointer): DocExportProgress = DocExportProgress(value)
+    override fun lower(value: DocExportProgress): Pointer {
+        return value.uniffiClonePointer()
+    }
+
+    override fun lift(value: Pointer): DocExportProgress {
+        return DocExportProgress(value)
+    }
 
     override fun read(buf: ByteBuffer): DocExportProgress {
         // The Rust code always writes pointers as 8 bytes, and will
@@ -7488,15 +6907,13 @@ public object FfiConverterTypeDocExportProgress : FfiConverter<DocExportProgress
 
     override fun allocationSize(value: DocExportProgress) = 8UL
 
-    override fun write(
-        value: DocExportProgress,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: DocExportProgress, buf: ByteBuffer) {
         // The Rust code always expects pointers written as 8 bytes,
         // and will fail to compile if they don't fit.
         buf.putLong(Pointer.nativeValue(lower(value)))
     }
 }
+
 
 // This template implements a class for working with a Rust struct via a Pointer/Arc<T>
 // to the live Rust struct on the other side of the FFI.
@@ -7595,14 +7012,16 @@ public object FfiConverterTypeDocExportProgress : FfiConverter<DocExportProgress
 // [1] https://stackoverflow.com/questions/24376768/can-java-finalize-an-object-when-it-is-still-in-scope/24380219
 //
 
+
 /**
  * The `progress` method will be called for each `DocImportProgress` event that is
  * emitted during a `doc.import_file()` call. Use the `DocImportProgress.type()`
  * method to check the `DocImportProgressType`
  */
 public interface DocImportFileCallback {
+    
     fun `progress`(`progress`: DocImportProgress)
-
+    
     companion object
 }
 
@@ -7611,10 +7030,8 @@ public interface DocImportFileCallback {
  * emitted during a `doc.import_file()` call. Use the `DocImportProgress.type()`
  * method to check the `DocImportProgressType`
  */
-open class DocImportFileCallbackImpl :
-    Disposable,
-    AutoCloseable,
-    DocImportFileCallback {
+open class DocImportFileCallbackImpl: Disposable, AutoCloseable, DocImportFileCallback {
+
     constructor(pointer: Pointer) {
         this.pointer = pointer
         this.cleanable = UniffiLib.CLEANER.register(this, UniffiCleanAction(pointer))
@@ -7664,7 +7081,7 @@ open class DocImportFileCallbackImpl :
             if (c == Long.MAX_VALUE) {
                 throw IllegalStateException("${this.javaClass.simpleName} call counter would overflow")
             }
-        } while (!this.callCounter.compareAndSet(c, c + 1L))
+        } while (! this.callCounter.compareAndSet(c, c + 1L))
         // Now we can safely do the method call without the pointer being freed concurrently.
         try {
             return block(this.uniffiClonePointer())
@@ -7678,9 +7095,7 @@ open class DocImportFileCallbackImpl :
 
     // Use a static inner class instead of a closure so as not to accidentally
     // capture `this` as part of the cleanable's action.
-    private class UniffiCleanAction(
-        private val pointer: Pointer?,
-    ) : Runnable {
+    private class UniffiCleanAction(private val pointer: Pointer?) : Runnable {
         override fun run() {
             pointer?.let { ptr ->
                 uniffiRustCall { status ->
@@ -7690,63 +7105,63 @@ open class DocImportFileCallbackImpl :
         }
     }
 
-    fun uniffiClonePointer(): Pointer =
-        uniffiRustCall { status ->
+    fun uniffiClonePointer(): Pointer {
+        return uniffiRustCall() { status ->
             UniffiLib.INSTANCE.uniffi_iroh_fn_clone_docimportfilecallback(pointer!!, status)
         }
+    }
 
-    @Throws(
-        CallbackException::class,
-        )
-    override fun `progress`(`progress`: DocImportProgress) =
-        callWithPointer {
-            uniffiRustCallWithError(CallbackException) { _status ->
-                UniffiLib.INSTANCE.uniffi_iroh_fn_method_docimportfilecallback_progress(
-                    it,
-                    FfiConverterTypeDocImportProgress.lower(`progress`),
-                    _status,
-                )
-            }
-        }
-
-    companion object
+    
+    @Throws(CallbackException::class)override fun `progress`(`progress`: DocImportProgress)
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(CallbackException) { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_docimportfilecallback_progress(
+        it, FfiConverterTypeDocImportProgress.lower(`progress`),_status)
 }
+    }
+    
+    
+
+    
+
+    
+    
+    companion object
+    
+}
+
 
 // Put the implementation in an object so we don't pollute the top-level namespace
 internal object uniffiCallbackInterfaceDocImportFileCallback {
-    internal object `progress` : UniffiCallbackInterfaceDocImportFileCallbackMethod0 {
-        override fun callback(
-            `uniffiHandle`: Long,
-            `progress`: Pointer,
-            `uniffiOutReturn`: Pointer,
-            uniffiCallStatus: UniffiRustCallStatus,
-        ) {
+    internal object `progress`: UniffiCallbackInterfaceDocImportFileCallbackMethod0 {
+        override fun callback(`uniffiHandle`: Long,`progress`: Pointer,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,) {
             val uniffiObj = FfiConverterTypeDocImportFileCallback.handleMap.get(uniffiHandle)
-            val makeCall = {  uniffiObj.`progress`(
-                FfiConverterTypeDocImportProgress.lift(`progress`),
-            )
+            val makeCall = { ->
+                uniffiObj.`progress`(
+                    FfiConverterTypeDocImportProgress.lift(`progress`),
+                )
             }
             val writeReturn = { _: Unit -> Unit }
             uniffiTraitInterfaceCallWithError(
                 uniffiCallStatus,
                 makeCall,
                 writeReturn,
-                { e: CallbackException -> FfiConverterTypeCallbackError.lower(e) },
+                { e: CallbackException -> FfiConverterTypeCallbackError.lower(e) }
             )
         }
     }
 
-    internal object uniffiFree : UniffiCallbackInterfaceFree {
+    internal object uniffiFree: UniffiCallbackInterfaceFree {
         override fun callback(handle: Long) {
             FfiConverterTypeDocImportFileCallback.handleMap.remove(handle)
         }
     }
 
-    internal var vtable =
-        UniffiVTableCallbackInterfaceDocImportFileCallback.UniffiByValue(
-            `progress`,
-            uniffiFree,
-        )
+    internal var vtable = UniffiVTableCallbackInterfaceDocImportFileCallback.UniffiByValue(
+        `progress`,
+        uniffiFree,
+    )
 
     // Registers the foreign callback with the Rust side.
     // This method is generated for each callback interface.
@@ -7755,12 +7170,16 @@ internal object uniffiCallbackInterfaceDocImportFileCallback {
     }
 }
 
-public object FfiConverterTypeDocImportFileCallback : FfiConverter<DocImportFileCallback, Pointer> {
+public object FfiConverterTypeDocImportFileCallback: FfiConverter<DocImportFileCallback, Pointer> {
     internal val handleMap = UniffiHandleMap<DocImportFileCallback>()
 
-    override fun lower(value: DocImportFileCallback): Pointer = Pointer(handleMap.insert(value))
+    override fun lower(value: DocImportFileCallback): Pointer {
+        return Pointer(handleMap.insert(value))
+    }
 
-    override fun lift(value: Pointer): DocImportFileCallback = DocImportFileCallbackImpl(value)
+    override fun lift(value: Pointer): DocImportFileCallback {
+        return DocImportFileCallbackImpl(value)
+    }
 
     override fun read(buf: ByteBuffer): DocImportFileCallback {
         // The Rust code always writes pointers as 8 bytes, and will
@@ -7770,15 +7189,13 @@ public object FfiConverterTypeDocImportFileCallback : FfiConverter<DocImportFile
 
     override fun allocationSize(value: DocImportFileCallback) = 8UL
 
-    override fun write(
-        value: DocImportFileCallback,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: DocImportFileCallback, buf: ByteBuffer) {
         // The Rust code always expects pointers written as 8 bytes,
         // and will fail to compile if they don't fit.
         buf.putLong(Pointer.nativeValue(lower(value)))
     }
 }
+
 
 // This template implements a class for working with a Rust struct via a Pointer/Arc<T>
 // to the live Rust struct on the other side of the FFI.
@@ -7877,50 +7294,50 @@ public object FfiConverterTypeDocImportFileCallback : FfiConverter<DocImportFile
 // [1] https://stackoverflow.com/questions/24376768/can-java-finalize-an-object-when-it-is-still-in-scope/24380219
 //
 
+
 /**
  * Progress updates for the doc import file operation.
  */
 public interface DocImportProgressInterface {
+    
     /**
      * Return the `DocImportProgressAbort`
      */
     fun `asAbort`(): DocImportProgressAbort
-
+    
     /**
      * Return the `DocImportProgressAllDone`
      */
     fun `asAllDone`(): DocImportProgressAllDone
-
+    
     /**
      * Return the `DocImportProgressFound` event
      */
     fun `asFound`(): DocImportProgressFound
-
+    
     /**
      * Return the `DocImportProgressDone` event
      */
     fun `asIngestDone`(): DocImportProgressIngestDone
-
+    
     /**
      * Return the `DocImportProgressProgress` event
      */
     fun `asProgress`(): DocImportProgressProgress
-
+    
     /**
      * Get the type of event
      */
     fun `type`(): DocImportProgressType
-
+    
     companion object
 }
 
 /**
  * Progress updates for the doc import file operation.
  */
-open class DocImportProgress :
-    Disposable,
-    AutoCloseable,
-    DocImportProgressInterface {
+open class DocImportProgress: Disposable, AutoCloseable, DocImportProgressInterface {
+
     constructor(pointer: Pointer) {
         this.pointer = pointer
         this.cleanable = UniffiLib.CLEANER.register(this, UniffiCleanAction(pointer))
@@ -7970,7 +7387,7 @@ open class DocImportProgress :
             if (c == Long.MAX_VALUE) {
                 throw IllegalStateException("${this.javaClass.simpleName} call counter would overflow")
             }
-        } while (!this.callCounter.compareAndSet(c, c + 1L))
+        } while (! this.callCounter.compareAndSet(c, c + 1L))
         // Now we can safely do the method call without the pointer being freed concurrently.
         try {
             return block(this.uniffiClonePointer())
@@ -7984,9 +7401,7 @@ open class DocImportProgress :
 
     // Use a static inner class instead of a closure so as not to accidentally
     // capture `this` as part of the cleanable's action.
-    private class UniffiCleanAction(
-        private val pointer: Pointer?,
-    ) : Runnable {
+    private class UniffiCleanAction(private val pointer: Pointer?) : Runnable {
         override fun run() {
             pointer?.let { ptr ->
                 uniffiRustCall { status ->
@@ -7996,108 +7411,119 @@ open class DocImportProgress :
         }
     }
 
-    fun uniffiClonePointer(): Pointer =
-        uniffiRustCall { status ->
+    fun uniffiClonePointer(): Pointer {
+        return uniffiRustCall() { status ->
             UniffiLib.INSTANCE.uniffi_iroh_fn_clone_docimportprogress(pointer!!, status)
         }
+    }
 
+    
     /**
      * Return the `DocImportProgressAbort`
-     */
-    override fun `asAbort`(): DocImportProgressAbort =
-        FfiConverterTypeDocImportProgressAbort.lift(
-            callWithPointer {
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_docimportprogress_as_abort(
-                        it,
-                        _status,
-                    )
-                }
-            },
-        )
+     */override fun `asAbort`(): DocImportProgressAbort {
+            return FfiConverterTypeDocImportProgressAbort.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_docimportprogress_as_abort(
+        it, _status)
+}
+    }
+    )
+    }
+    
 
+    
     /**
      * Return the `DocImportProgressAllDone`
-     */
-    override fun `asAllDone`(): DocImportProgressAllDone =
-        FfiConverterTypeDocImportProgressAllDone.lift(
-            callWithPointer {
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_docimportprogress_as_all_done(
-                        it,
-                        _status,
-                    )
-                }
-            },
-        )
+     */override fun `asAllDone`(): DocImportProgressAllDone {
+            return FfiConverterTypeDocImportProgressAllDone.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_docimportprogress_as_all_done(
+        it, _status)
+}
+    }
+    )
+    }
+    
 
+    
     /**
      * Return the `DocImportProgressFound` event
-     */
-    override fun `asFound`(): DocImportProgressFound =
-        FfiConverterTypeDocImportProgressFound.lift(
-            callWithPointer {
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_docimportprogress_as_found(
-                        it,
-                        _status,
-                    )
-                }
-            },
-        )
+     */override fun `asFound`(): DocImportProgressFound {
+            return FfiConverterTypeDocImportProgressFound.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_docimportprogress_as_found(
+        it, _status)
+}
+    }
+    )
+    }
+    
 
+    
     /**
      * Return the `DocImportProgressDone` event
-     */
-    override fun `asIngestDone`(): DocImportProgressIngestDone =
-        FfiConverterTypeDocImportProgressIngestDone.lift(
-            callWithPointer {
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_docimportprogress_as_ingest_done(
-                        it,
-                        _status,
-                    )
-                }
-            },
-        )
+     */override fun `asIngestDone`(): DocImportProgressIngestDone {
+            return FfiConverterTypeDocImportProgressIngestDone.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_docimportprogress_as_ingest_done(
+        it, _status)
+}
+    }
+    )
+    }
+    
 
+    
     /**
      * Return the `DocImportProgressProgress` event
-     */
-    override fun `asProgress`(): DocImportProgressProgress =
-        FfiConverterTypeDocImportProgressProgress.lift(
-            callWithPointer {
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_docimportprogress_as_progress(
-                        it,
-                        _status,
-                    )
-                }
-            },
-        )
+     */override fun `asProgress`(): DocImportProgressProgress {
+            return FfiConverterTypeDocImportProgressProgress.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_docimportprogress_as_progress(
+        it, _status)
+}
+    }
+    )
+    }
+    
 
+    
     /**
      * Get the type of event
-     */
-    override fun `type`(): DocImportProgressType =
-        FfiConverterTypeDocImportProgressType.lift(
-            callWithPointer {
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_docimportprogress_type(
-                        it,
-                        _status,
-                    )
-                }
-            },
-        )
+     */override fun `type`(): DocImportProgressType {
+            return FfiConverterTypeDocImportProgressType.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_docimportprogress_type(
+        it, _status)
+}
+    }
+    )
+    }
+    
 
+    
+
+    
+    
     companion object
+    
 }
 
-public object FfiConverterTypeDocImportProgress : FfiConverter<DocImportProgress, Pointer> {
-    override fun lower(value: DocImportProgress): Pointer = value.uniffiClonePointer()
+public object FfiConverterTypeDocImportProgress: FfiConverter<DocImportProgress, Pointer> {
 
-    override fun lift(value: Pointer): DocImportProgress = DocImportProgress(value)
+    override fun lower(value: DocImportProgress): Pointer {
+        return value.uniffiClonePointer()
+    }
+
+    override fun lift(value: Pointer): DocImportProgress {
+        return DocImportProgress(value)
+    }
 
     override fun read(buf: ByteBuffer): DocImportProgress {
         // The Rust code always writes pointers as 8 bytes, and will
@@ -8107,15 +7533,13 @@ public object FfiConverterTypeDocImportProgress : FfiConverter<DocImportProgress
 
     override fun allocationSize(value: DocImportProgress) = 8UL
 
-    override fun write(
-        value: DocImportProgress,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: DocImportProgress, buf: ByteBuffer) {
         // The Rust code always expects pointers written as 8 bytes,
         // and will fail to compile if they don't fit.
         buf.putLong(Pointer.nativeValue(lower(value)))
     }
 }
+
 
 // This template implements a class for working with a Rust struct via a Pointer/Arc<T>
 // to the live Rust struct on the other side of the FFI.
@@ -8214,14 +7638,16 @@ public object FfiConverterTypeDocImportProgress : FfiConverter<DocImportProgress
 // [1] https://stackoverflow.com/questions/24376768/can-java-finalize-an-object-when-it-is-still-in-scope/24380219
 //
 
+
 /**
  * The `progress` method will be called for each `DownloadProgress` event that is emitted during
  * a `node.blobs_download`. Use the `DownloadProgress.type()` method to check the
  * `DownloadProgressType` of the event.
  */
 public interface DownloadCallback {
+    
     fun `progress`(`progress`: DownloadProgress)
-
+    
     companion object
 }
 
@@ -8230,10 +7656,8 @@ public interface DownloadCallback {
  * a `node.blobs_download`. Use the `DownloadProgress.type()` method to check the
  * `DownloadProgressType` of the event.
  */
-open class DownloadCallbackImpl :
-    Disposable,
-    AutoCloseable,
-    DownloadCallback {
+open class DownloadCallbackImpl: Disposable, AutoCloseable, DownloadCallback {
+
     constructor(pointer: Pointer) {
         this.pointer = pointer
         this.cleanable = UniffiLib.CLEANER.register(this, UniffiCleanAction(pointer))
@@ -8283,7 +7707,7 @@ open class DownloadCallbackImpl :
             if (c == Long.MAX_VALUE) {
                 throw IllegalStateException("${this.javaClass.simpleName} call counter would overflow")
             }
-        } while (!this.callCounter.compareAndSet(c, c + 1L))
+        } while (! this.callCounter.compareAndSet(c, c + 1L))
         // Now we can safely do the method call without the pointer being freed concurrently.
         try {
             return block(this.uniffiClonePointer())
@@ -8297,9 +7721,7 @@ open class DownloadCallbackImpl :
 
     // Use a static inner class instead of a closure so as not to accidentally
     // capture `this` as part of the cleanable's action.
-    private class UniffiCleanAction(
-        private val pointer: Pointer?,
-    ) : Runnable {
+    private class UniffiCleanAction(private val pointer: Pointer?) : Runnable {
         override fun run() {
             pointer?.let { ptr ->
                 uniffiRustCall { status ->
@@ -8309,63 +7731,63 @@ open class DownloadCallbackImpl :
         }
     }
 
-    fun uniffiClonePointer(): Pointer =
-        uniffiRustCall { status ->
+    fun uniffiClonePointer(): Pointer {
+        return uniffiRustCall() { status ->
             UniffiLib.INSTANCE.uniffi_iroh_fn_clone_downloadcallback(pointer!!, status)
         }
+    }
 
-    @Throws(
-        CallbackException::class,
-        )
-    override fun `progress`(`progress`: DownloadProgress) =
-        callWithPointer {
-            uniffiRustCallWithError(CallbackException) { _status ->
-                UniffiLib.INSTANCE.uniffi_iroh_fn_method_downloadcallback_progress(
-                    it,
-                    FfiConverterTypeDownloadProgress.lower(`progress`),
-                    _status,
-                )
-            }
-        }
-
-    companion object
+    
+    @Throws(CallbackException::class)override fun `progress`(`progress`: DownloadProgress)
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(CallbackException) { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_downloadcallback_progress(
+        it, FfiConverterTypeDownloadProgress.lower(`progress`),_status)
 }
+    }
+    
+    
+
+    
+
+    
+    
+    companion object
+    
+}
+
 
 // Put the implementation in an object so we don't pollute the top-level namespace
 internal object uniffiCallbackInterfaceDownloadCallback {
-    internal object `progress` : UniffiCallbackInterfaceDownloadCallbackMethod0 {
-        override fun callback(
-            `uniffiHandle`: Long,
-            `progress`: Pointer,
-            `uniffiOutReturn`: Pointer,
-            uniffiCallStatus: UniffiRustCallStatus,
-        ) {
+    internal object `progress`: UniffiCallbackInterfaceDownloadCallbackMethod0 {
+        override fun callback(`uniffiHandle`: Long,`progress`: Pointer,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,) {
             val uniffiObj = FfiConverterTypeDownloadCallback.handleMap.get(uniffiHandle)
-            val makeCall = {  uniffiObj.`progress`(
-                FfiConverterTypeDownloadProgress.lift(`progress`),
-            )
+            val makeCall = { ->
+                uniffiObj.`progress`(
+                    FfiConverterTypeDownloadProgress.lift(`progress`),
+                )
             }
             val writeReturn = { _: Unit -> Unit }
             uniffiTraitInterfaceCallWithError(
                 uniffiCallStatus,
                 makeCall,
                 writeReturn,
-                { e: CallbackException -> FfiConverterTypeCallbackError.lower(e) },
+                { e: CallbackException -> FfiConverterTypeCallbackError.lower(e) }
             )
         }
     }
 
-    internal object uniffiFree : UniffiCallbackInterfaceFree {
+    internal object uniffiFree: UniffiCallbackInterfaceFree {
         override fun callback(handle: Long) {
             FfiConverterTypeDownloadCallback.handleMap.remove(handle)
         }
     }
 
-    internal var vtable =
-        UniffiVTableCallbackInterfaceDownloadCallback.UniffiByValue(
-            `progress`,
-            uniffiFree,
-        )
+    internal var vtable = UniffiVTableCallbackInterfaceDownloadCallback.UniffiByValue(
+        `progress`,
+        uniffiFree,
+    )
 
     // Registers the foreign callback with the Rust side.
     // This method is generated for each callback interface.
@@ -8374,12 +7796,16 @@ internal object uniffiCallbackInterfaceDownloadCallback {
     }
 }
 
-public object FfiConverterTypeDownloadCallback : FfiConverter<DownloadCallback, Pointer> {
+public object FfiConverterTypeDownloadCallback: FfiConverter<DownloadCallback, Pointer> {
     internal val handleMap = UniffiHandleMap<DownloadCallback>()
 
-    override fun lower(value: DownloadCallback): Pointer = Pointer(handleMap.insert(value))
+    override fun lower(value: DownloadCallback): Pointer {
+        return Pointer(handleMap.insert(value))
+    }
 
-    override fun lift(value: Pointer): DownloadCallback = DownloadCallbackImpl(value)
+    override fun lift(value: Pointer): DownloadCallback {
+        return DownloadCallbackImpl(value)
+    }
 
     override fun read(buf: ByteBuffer): DownloadCallback {
         // The Rust code always writes pointers as 8 bytes, and will
@@ -8389,15 +7815,13 @@ public object FfiConverterTypeDownloadCallback : FfiConverter<DownloadCallback, 
 
     override fun allocationSize(value: DownloadCallback) = 8UL
 
-    override fun write(
-        value: DownloadCallback,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: DownloadCallback, buf: ByteBuffer) {
         // The Rust code always expects pointers written as 8 bytes,
         // and will fail to compile if they don't fit.
         buf.putLong(Pointer.nativeValue(lower(value)))
     }
 }
+
 
 // This template implements a class for working with a Rust struct via a Pointer/Arc<T>
 // to the live Rust struct on the other side of the FFI.
@@ -8496,20 +7920,20 @@ public object FfiConverterTypeDownloadCallback : FfiConverter<DownloadCallback, 
 // [1] https://stackoverflow.com/questions/24376768/can-java-finalize-an-object-when-it-is-still-in-scope/24380219
 //
 
+
 /**
  * Download policy to decide which content blobs shall be downloaded.
  */
 public interface DownloadPolicyInterface {
+    
     companion object
 }
 
 /**
  * Download policy to decide which content blobs shall be downloaded.
  */
-open class DownloadPolicy :
-    Disposable,
-    AutoCloseable,
-    DownloadPolicyInterface {
+open class DownloadPolicy: Disposable, AutoCloseable, DownloadPolicyInterface {
+
     constructor(pointer: Pointer) {
         this.pointer = pointer
         this.cleanable = UniffiLib.CLEANER.register(this, UniffiCleanAction(pointer))
@@ -8559,7 +7983,7 @@ open class DownloadPolicy :
             if (c == Long.MAX_VALUE) {
                 throw IllegalStateException("${this.javaClass.simpleName} call counter would overflow")
             }
-        } while (!this.callCounter.compareAndSet(c, c + 1L))
+        } while (! this.callCounter.compareAndSet(c, c + 1L))
         // Now we can safely do the method call without the pointer being freed concurrently.
         try {
             return block(this.uniffiClonePointer())
@@ -8573,9 +7997,7 @@ open class DownloadPolicy :
 
     // Use a static inner class instead of a closure so as not to accidentally
     // capture `this` as part of the cleanable's action.
-    private class UniffiCleanAction(
-        private val pointer: Pointer?,
-    ) : Runnable {
+    private class UniffiCleanAction(private val pointer: Pointer?) : Runnable {
         override fun run() {
             pointer?.let { ptr ->
                 uniffiRustCall { status ->
@@ -8585,68 +8007,82 @@ open class DownloadPolicy :
         }
     }
 
-    fun uniffiClonePointer(): Pointer =
-        uniffiRustCall { status ->
+    fun uniffiClonePointer(): Pointer {
+        return uniffiRustCall() { status ->
             UniffiLib.INSTANCE.uniffi_iroh_fn_clone_downloadpolicy(pointer!!, status)
         }
-
-    companion object {
-        /**
-         * Download everything
-         */
-        fun `everything`(): DownloadPolicy =
-            FfiConverterTypeDownloadPolicy.lift(
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_constructor_downloadpolicy_everything(
-                        _status,
-                    )
-                },
-            )
-
-        /**
-         * Download everything except keys that match the given filters
-         */
-        fun `everythingExcept`(`filters`: List<FilterKind>): DownloadPolicy =
-            FfiConverterTypeDownloadPolicy.lift(
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_constructor_downloadpolicy_everything_except(
-                        FfiConverterSequenceTypeFilterKind.lower(`filters`),
-                        _status,
-                    )
-                },
-            )
-
-        /**
-         * Download nothing
-         */
-        fun `nothing`(): DownloadPolicy =
-            FfiConverterTypeDownloadPolicy.lift(
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_constructor_downloadpolicy_nothing(
-                        _status,
-                    )
-                },
-            )
-
-        /**
-         * Download nothing except keys that match the given filters
-         */
-        fun `nothingExcept`(`filters`: List<FilterKind>): DownloadPolicy =
-            FfiConverterTypeDownloadPolicy.lift(
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_constructor_downloadpolicy_nothing_except(
-                        FfiConverterSequenceTypeFilterKind.lower(`filters`),
-                        _status,
-                    )
-                },
-            )
     }
+
+    
+
+    
+    companion object {
+        
+    /**
+     * Download everything
+     */ fun `everything`(): DownloadPolicy {
+            return FfiConverterTypeDownloadPolicy.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_constructor_downloadpolicy_everything(
+        _status)
+}
+    )
+    }
+    
+
+        
+    /**
+     * Download everything except keys that match the given filters
+     */ fun `everythingExcept`(`filters`: List<FilterKind>): DownloadPolicy {
+            return FfiConverterTypeDownloadPolicy.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_constructor_downloadpolicy_everything_except(
+        FfiConverterSequenceTypeFilterKind.lower(`filters`),_status)
+}
+    )
+    }
+    
+
+        
+    /**
+     * Download nothing
+     */ fun `nothing`(): DownloadPolicy {
+            return FfiConverterTypeDownloadPolicy.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_constructor_downloadpolicy_nothing(
+        _status)
+}
+    )
+    }
+    
+
+        
+    /**
+     * Download nothing except keys that match the given filters
+     */ fun `nothingExcept`(`filters`: List<FilterKind>): DownloadPolicy {
+            return FfiConverterTypeDownloadPolicy.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_constructor_downloadpolicy_nothing_except(
+        FfiConverterSequenceTypeFilterKind.lower(`filters`),_status)
+}
+    )
+    }
+    
+
+        
+    }
+    
 }
 
-public object FfiConverterTypeDownloadPolicy : FfiConverter<DownloadPolicy, Pointer> {
-    override fun lower(value: DownloadPolicy): Pointer = value.uniffiClonePointer()
+public object FfiConverterTypeDownloadPolicy: FfiConverter<DownloadPolicy, Pointer> {
 
-    override fun lift(value: Pointer): DownloadPolicy = DownloadPolicy(value)
+    override fun lower(value: DownloadPolicy): Pointer {
+        return value.uniffiClonePointer()
+    }
+
+    override fun lift(value: Pointer): DownloadPolicy {
+        return DownloadPolicy(value)
+    }
 
     override fun read(buf: ByteBuffer): DownloadPolicy {
         // The Rust code always writes pointers as 8 bytes, and will
@@ -8656,15 +8092,13 @@ public object FfiConverterTypeDownloadPolicy : FfiConverter<DownloadPolicy, Poin
 
     override fun allocationSize(value: DownloadPolicy) = 8UL
 
-    override fun write(
-        value: DownloadPolicy,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: DownloadPolicy, buf: ByteBuffer) {
         // The Rust code always expects pointers written as 8 bytes,
         // and will fail to compile if they don't fit.
         buf.putLong(Pointer.nativeValue(lower(value)))
     }
 }
+
 
 // This template implements a class for working with a Rust struct via a Pointer/Arc<T>
 // to the live Rust struct on the other side of the FFI.
@@ -8763,61 +8197,61 @@ public object FfiConverterTypeDownloadPolicy : FfiConverter<DownloadPolicy, Poin
 // [1] https://stackoverflow.com/questions/24376768/can-java-finalize-an-object-when-it-is-still-in-scope/24380219
 //
 
+
 /**
  * Progress updates for the get operation.
  */
 public interface DownloadProgressInterface {
+    
     /**
      * Return the `DownloadProgressAbort`
      */
     fun `asAbort`(): DownloadProgressAbort
-
+    
     /**
      * Return the `DownloadProgressAllDone` event
      */
     fun `asAllDone`(): DownloadProgressAllDone
-
+    
     /**
      * Return the `DownloadProgressDone` event
      */
     fun `asDone`(): DownloadProgressDone
-
+    
     /**
      * Return the `DownloadProgressFound` event
      */
     fun `asFound`(): DownloadProgressFound
-
+    
     /**
      * Return the `DownloadProgressFoundHashSeq` event
      */
     fun `asFoundHashSeq`(): DownloadProgressFoundHashSeq
-
+    
     /**
      * Return the `DownloadProgressFoundLocal` event
      */
     fun `asFoundLocal`(): DownloadProgressFoundLocal
-
+    
     /**
      * Return the `DownloadProgressProgress` event
      */
     fun `asProgress`(): DownloadProgressProgress
-
+    
     /**
      * Get the type of event
      * note that there is no `as_connected` method, as the `Connected` event has no associated data
      */
     fun `type`(): DownloadProgressType
-
+    
     companion object
 }
 
 /**
  * Progress updates for the get operation.
  */
-open class DownloadProgress :
-    Disposable,
-    AutoCloseable,
-    DownloadProgressInterface {
+open class DownloadProgress: Disposable, AutoCloseable, DownloadProgressInterface {
+
     constructor(pointer: Pointer) {
         this.pointer = pointer
         this.cleanable = UniffiLib.CLEANER.register(this, UniffiCleanAction(pointer))
@@ -8867,7 +8301,7 @@ open class DownloadProgress :
             if (c == Long.MAX_VALUE) {
                 throw IllegalStateException("${this.javaClass.simpleName} call counter would overflow")
             }
-        } while (!this.callCounter.compareAndSet(c, c + 1L))
+        } while (! this.callCounter.compareAndSet(c, c + 1L))
         // Now we can safely do the method call without the pointer being freed concurrently.
         try {
             return block(this.uniffiClonePointer())
@@ -8881,9 +8315,7 @@ open class DownloadProgress :
 
     // Use a static inner class instead of a closure so as not to accidentally
     // capture `this` as part of the cleanable's action.
-    private class UniffiCleanAction(
-        private val pointer: Pointer?,
-    ) : Runnable {
+    private class UniffiCleanAction(private val pointer: Pointer?) : Runnable {
         override fun run() {
             pointer?.let { ptr ->
                 uniffiRustCall { status ->
@@ -8893,139 +8325,150 @@ open class DownloadProgress :
         }
     }
 
-    fun uniffiClonePointer(): Pointer =
-        uniffiRustCall { status ->
+    fun uniffiClonePointer(): Pointer {
+        return uniffiRustCall() { status ->
             UniffiLib.INSTANCE.uniffi_iroh_fn_clone_downloadprogress(pointer!!, status)
         }
+    }
 
+    
     /**
      * Return the `DownloadProgressAbort`
-     */
-    override fun `asAbort`(): DownloadProgressAbort =
-        FfiConverterTypeDownloadProgressAbort.lift(
-            callWithPointer {
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_downloadprogress_as_abort(
-                        it,
-                        _status,
-                    )
-                }
-            },
-        )
+     */override fun `asAbort`(): DownloadProgressAbort {
+            return FfiConverterTypeDownloadProgressAbort.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_downloadprogress_as_abort(
+        it, _status)
+}
+    }
+    )
+    }
+    
 
+    
     /**
      * Return the `DownloadProgressAllDone` event
-     */
-    override fun `asAllDone`(): DownloadProgressAllDone =
-        FfiConverterTypeDownloadProgressAllDone.lift(
-            callWithPointer {
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_downloadprogress_as_all_done(
-                        it,
-                        _status,
-                    )
-                }
-            },
-        )
+     */override fun `asAllDone`(): DownloadProgressAllDone {
+            return FfiConverterTypeDownloadProgressAllDone.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_downloadprogress_as_all_done(
+        it, _status)
+}
+    }
+    )
+    }
+    
 
+    
     /**
      * Return the `DownloadProgressDone` event
-     */
-    override fun `asDone`(): DownloadProgressDone =
-        FfiConverterTypeDownloadProgressDone.lift(
-            callWithPointer {
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_downloadprogress_as_done(
-                        it,
-                        _status,
-                    )
-                }
-            },
-        )
+     */override fun `asDone`(): DownloadProgressDone {
+            return FfiConverterTypeDownloadProgressDone.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_downloadprogress_as_done(
+        it, _status)
+}
+    }
+    )
+    }
+    
 
+    
     /**
      * Return the `DownloadProgressFound` event
-     */
-    override fun `asFound`(): DownloadProgressFound =
-        FfiConverterTypeDownloadProgressFound.lift(
-            callWithPointer {
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_downloadprogress_as_found(
-                        it,
-                        _status,
-                    )
-                }
-            },
-        )
+     */override fun `asFound`(): DownloadProgressFound {
+            return FfiConverterTypeDownloadProgressFound.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_downloadprogress_as_found(
+        it, _status)
+}
+    }
+    )
+    }
+    
 
+    
     /**
      * Return the `DownloadProgressFoundHashSeq` event
-     */
-    override fun `asFoundHashSeq`(): DownloadProgressFoundHashSeq =
-        FfiConverterTypeDownloadProgressFoundHashSeq.lift(
-            callWithPointer {
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_downloadprogress_as_found_hash_seq(
-                        it,
-                        _status,
-                    )
-                }
-            },
-        )
+     */override fun `asFoundHashSeq`(): DownloadProgressFoundHashSeq {
+            return FfiConverterTypeDownloadProgressFoundHashSeq.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_downloadprogress_as_found_hash_seq(
+        it, _status)
+}
+    }
+    )
+    }
+    
 
+    
     /**
      * Return the `DownloadProgressFoundLocal` event
-     */
-    override fun `asFoundLocal`(): DownloadProgressFoundLocal =
-        FfiConverterTypeDownloadProgressFoundLocal.lift(
-            callWithPointer {
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_downloadprogress_as_found_local(
-                        it,
-                        _status,
-                    )
-                }
-            },
-        )
+     */override fun `asFoundLocal`(): DownloadProgressFoundLocal {
+            return FfiConverterTypeDownloadProgressFoundLocal.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_downloadprogress_as_found_local(
+        it, _status)
+}
+    }
+    )
+    }
+    
 
+    
     /**
      * Return the `DownloadProgressProgress` event
-     */
-    override fun `asProgress`(): DownloadProgressProgress =
-        FfiConverterTypeDownloadProgressProgress.lift(
-            callWithPointer {
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_downloadprogress_as_progress(
-                        it,
-                        _status,
-                    )
-                }
-            },
-        )
+     */override fun `asProgress`(): DownloadProgressProgress {
+            return FfiConverterTypeDownloadProgressProgress.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_downloadprogress_as_progress(
+        it, _status)
+}
+    }
+    )
+    }
+    
 
+    
     /**
      * Get the type of event
      * note that there is no `as_connected` method, as the `Connected` event has no associated data
-     */
-    override fun `type`(): DownloadProgressType =
-        FfiConverterTypeDownloadProgressType.lift(
-            callWithPointer {
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_downloadprogress_type(
-                        it,
-                        _status,
-                    )
-                }
-            },
-        )
+     */override fun `type`(): DownloadProgressType {
+            return FfiConverterTypeDownloadProgressType.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_downloadprogress_type(
+        it, _status)
+}
+    }
+    )
+    }
+    
 
+    
+
+    
+    
     companion object
+    
 }
 
-public object FfiConverterTypeDownloadProgress : FfiConverter<DownloadProgress, Pointer> {
-    override fun lower(value: DownloadProgress): Pointer = value.uniffiClonePointer()
+public object FfiConverterTypeDownloadProgress: FfiConverter<DownloadProgress, Pointer> {
 
-    override fun lift(value: Pointer): DownloadProgress = DownloadProgress(value)
+    override fun lower(value: DownloadProgress): Pointer {
+        return value.uniffiClonePointer()
+    }
+
+    override fun lift(value: Pointer): DownloadProgress {
+        return DownloadProgress(value)
+    }
 
     override fun read(buf: ByteBuffer): DownloadProgress {
         // The Rust code always writes pointers as 8 bytes, and will
@@ -9035,15 +8478,13 @@ public object FfiConverterTypeDownloadProgress : FfiConverter<DownloadProgress, 
 
     override fun allocationSize(value: DownloadProgress) = 8UL
 
-    override fun write(
-        value: DownloadProgress,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: DownloadProgress, buf: ByteBuffer) {
         // The Rust code always expects pointers written as 8 bytes,
         // and will fail to compile if they don't fit.
         buf.putLong(Pointer.nativeValue(lower(value)))
     }
 }
+
 
 // This template implements a class for working with a Rust struct via a Pointer/Arc<T>
 // to the live Rust struct on the other side of the FFI.
@@ -9141,6 +8582,7 @@ public object FfiConverterTypeDownloadProgress : FfiConverter<DownloadProgress, 
 //
 // [1] https://stackoverflow.com/questions/24376768/can-java-finalize-an-object-when-it-is-still-in-scope/24380219
 //
+
 
 /**
  * A single entry in a [`Doc`]
@@ -9150,11 +8592,12 @@ public object FfiConverterTypeDownloadProgress : FfiConverter<DownloadProgress, 
  * of the entry's content data, the size of this content data, and a timestamp.
  */
 public interface EntryInterface {
+    
     /**
      * Get the [`AuthorId`] of this entry.
      */
     fun `author`(): AuthorId
-
+    
     /**
      * Read all content of an [`Entry`] into a buffer.
      * This allocates a buffer for the full entry. Use only if you know that the entry you're
@@ -9162,32 +8605,32 @@ public interface EntryInterface {
      * before calling [`Self::content_bytes`].
      */
     fun `contentBytes`(`doc`: Doc): kotlin.ByteArray
-
+    
     /**
      * Get the content_hash of this entry.
      */
     fun `contentHash`(): Hash
-
+    
     /**
      * Get the content_length of this entry.
      */
     fun `contentLen`(): kotlin.ULong
-
+    
     /**
      * Get the key of this entry.
      */
     fun `key`(): kotlin.ByteArray
-
+    
     /**
      * Get the namespace id of this entry.
      */
     fun `namespace`(): kotlin.String
-
+    
     /**
      * Get the timestamp when this entry was written.
      */
     fun `timestamp`(): kotlin.ULong
-
+    
     companion object
 }
 
@@ -9198,10 +8641,8 @@ public interface EntryInterface {
  * namespace id. Its value is the 32-byte BLAKE3 [`hash`]
  * of the entry's content data, the size of this content data, and a timestamp.
  */
-open class Entry :
-    Disposable,
-    AutoCloseable,
-    EntryInterface {
+open class Entry: Disposable, AutoCloseable, EntryInterface {
+
     constructor(pointer: Pointer) {
         this.pointer = pointer
         this.cleanable = UniffiLib.CLEANER.register(this, UniffiCleanAction(pointer))
@@ -9251,7 +8692,7 @@ open class Entry :
             if (c == Long.MAX_VALUE) {
                 throw IllegalStateException("${this.javaClass.simpleName} call counter would overflow")
             }
-        } while (!this.callCounter.compareAndSet(c, c + 1L))
+        } while (! this.callCounter.compareAndSet(c, c + 1L))
         // Now we can safely do the method call without the pointer being freed concurrently.
         try {
             return block(this.uniffiClonePointer())
@@ -9265,9 +8706,7 @@ open class Entry :
 
     // Use a static inner class instead of a closure so as not to accidentally
     // capture `this` as part of the cleanable's action.
-    private class UniffiCleanAction(
-        private val pointer: Pointer?,
-    ) : Runnable {
+    private class UniffiCleanAction(private val pointer: Pointer?) : Runnable {
         override fun run() {
             pointer?.let { ptr ->
                 uniffiRustCall { status ->
@@ -9277,130 +8716,138 @@ open class Entry :
         }
     }
 
-    fun uniffiClonePointer(): Pointer =
-        uniffiRustCall { status ->
+    fun uniffiClonePointer(): Pointer {
+        return uniffiRustCall() { status ->
             UniffiLib.INSTANCE.uniffi_iroh_fn_clone_entry(pointer!!, status)
         }
+    }
 
+    
     /**
      * Get the [`AuthorId`] of this entry.
-     */
-    override fun `author`(): AuthorId =
-        FfiConverterTypeAuthorId.lift(
-            callWithPointer {
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_entry_author(
-                        it,
-                        _status,
-                    )
-                }
-            },
-        )
+     */override fun `author`(): AuthorId {
+            return FfiConverterTypeAuthorId.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_entry_author(
+        it, _status)
+}
+    }
+    )
+    }
+    
 
+    
     /**
      * Read all content of an [`Entry`] into a buffer.
      * This allocates a buffer for the full entry. Use only if you know that the entry you're
      * reading is small. If not sure, use [`Self::content_len`] and check the size with
      * before calling [`Self::content_bytes`].
      */
-    @Throws(
-        IrohException::class,
-        )
-    override fun `contentBytes`(`doc`: Doc): kotlin.ByteArray =
-        FfiConverterByteArray.lift(
-            callWithPointer {
-                uniffiRustCallWithError(IrohException) { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_entry_content_bytes(
-                        it,
-                        FfiConverterTypeDoc.lower(`doc`),
-                        _status,
-                    )
-                }
-            },
-        )
+    @Throws(IrohException::class)override fun `contentBytes`(`doc`: Doc): kotlin.ByteArray {
+            return FfiConverterByteArray.lift(
+    callWithPointer {
+    uniffiRustCallWithError(IrohException) { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_entry_content_bytes(
+        it, FfiConverterTypeDoc.lower(`doc`),_status)
+}
+    }
+    )
+    }
+    
 
+    
     /**
      * Get the content_hash of this entry.
-     */
-    override fun `contentHash`(): Hash =
-        FfiConverterTypeHash.lift(
-            callWithPointer {
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_entry_content_hash(
-                        it,
-                        _status,
-                    )
-                }
-            },
-        )
+     */override fun `contentHash`(): Hash {
+            return FfiConverterTypeHash.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_entry_content_hash(
+        it, _status)
+}
+    }
+    )
+    }
+    
 
+    
     /**
      * Get the content_length of this entry.
-     */
-    override fun `contentLen`(): kotlin.ULong =
-        FfiConverterULong.lift(
-            callWithPointer {
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_entry_content_len(
-                        it,
-                        _status,
-                    )
-                }
-            },
-        )
+     */override fun `contentLen`(): kotlin.ULong {
+            return FfiConverterULong.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_entry_content_len(
+        it, _status)
+}
+    }
+    )
+    }
+    
 
+    
     /**
      * Get the key of this entry.
-     */
-    override fun `key`(): kotlin.ByteArray =
-        FfiConverterByteArray.lift(
-            callWithPointer {
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_entry_key(
-                        it,
-                        _status,
-                    )
-                }
-            },
-        )
+     */override fun `key`(): kotlin.ByteArray {
+            return FfiConverterByteArray.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_entry_key(
+        it, _status)
+}
+    }
+    )
+    }
+    
 
+    
     /**
      * Get the namespace id of this entry.
-     */
-    override fun `namespace`(): kotlin.String =
-        FfiConverterString.lift(
-            callWithPointer {
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_entry_namespace(
-                        it,
-                        _status,
-                    )
-                }
-            },
-        )
+     */override fun `namespace`(): kotlin.String {
+            return FfiConverterString.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_entry_namespace(
+        it, _status)
+}
+    }
+    )
+    }
+    
 
+    
     /**
      * Get the timestamp when this entry was written.
-     */
-    override fun `timestamp`(): kotlin.ULong =
-        FfiConverterULong.lift(
-            callWithPointer {
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_entry_timestamp(
-                        it,
-                        _status,
-                    )
-                }
-            },
-        )
+     */override fun `timestamp`(): kotlin.ULong {
+            return FfiConverterULong.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_entry_timestamp(
+        it, _status)
+}
+    }
+    )
+    }
+    
 
+    
+
+    
+    
     companion object
+    
 }
 
-public object FfiConverterTypeEntry : FfiConverter<Entry, Pointer> {
-    override fun lower(value: Entry): Pointer = value.uniffiClonePointer()
+public object FfiConverterTypeEntry: FfiConverter<Entry, Pointer> {
 
-    override fun lift(value: Pointer): Entry = Entry(value)
+    override fun lower(value: Entry): Pointer {
+        return value.uniffiClonePointer()
+    }
+
+    override fun lift(value: Pointer): Entry {
+        return Entry(value)
+    }
 
     override fun read(buf: ByteBuffer): Entry {
         // The Rust code always writes pointers as 8 bytes, and will
@@ -9410,15 +8857,13 @@ public object FfiConverterTypeEntry : FfiConverter<Entry, Pointer> {
 
     override fun allocationSize(value: Entry) = 8UL
 
-    override fun write(
-        value: Entry,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: Entry, buf: ByteBuffer) {
         // The Rust code always expects pointers written as 8 bytes,
         // and will fail to compile if they don't fit.
         buf.putLong(Pointer.nativeValue(lower(value)))
     }
 }
+
 
 // This template implements a class for working with a Rust struct via a Pointer/Arc<T>
 // to the live Rust struct on the other side of the FFI.
@@ -9517,25 +8962,25 @@ public object FfiConverterTypeEntry : FfiConverter<Entry, Pointer> {
 // [1] https://stackoverflow.com/questions/24376768/can-java-finalize-an-object-when-it-is-still-in-scope/24380219
 //
 
+
 /**
  * Filter strategy used in download policies.
  */
 public interface FilterKindInterface {
+    
     /**
      * Verifies whether this filter matches a given key
      */
     fun `matches`(`key`: kotlin.ByteArray): kotlin.Boolean
-
+    
     companion object
 }
 
 /**
  * Filter strategy used in download policies.
  */
-open class FilterKind :
-    Disposable,
-    AutoCloseable,
-    FilterKindInterface {
+open class FilterKind: Disposable, AutoCloseable, FilterKindInterface {
+
     constructor(pointer: Pointer) {
         this.pointer = pointer
         this.cleanable = UniffiLib.CLEANER.register(this, UniffiCleanAction(pointer))
@@ -9585,7 +9030,7 @@ open class FilterKind :
             if (c == Long.MAX_VALUE) {
                 throw IllegalStateException("${this.javaClass.simpleName} call counter would overflow")
             }
-        } while (!this.callCounter.compareAndSet(c, c + 1L))
+        } while (! this.callCounter.compareAndSet(c, c + 1L))
         // Now we can safely do the method call without the pointer being freed concurrently.
         try {
             return block(this.uniffiClonePointer())
@@ -9599,9 +9044,7 @@ open class FilterKind :
 
     // Use a static inner class instead of a closure so as not to accidentally
     // capture `this` as part of the cleanable's action.
-    private class UniffiCleanAction(
-        private val pointer: Pointer?,
-    ) : Runnable {
+    private class UniffiCleanAction(private val pointer: Pointer?) : Runnable {
         override fun run() {
             pointer?.let { ptr ->
                 uniffiRustCall { status ->
@@ -9611,60 +9054,71 @@ open class FilterKind :
         }
     }
 
-    fun uniffiClonePointer(): Pointer =
-        uniffiRustCall { status ->
+    fun uniffiClonePointer(): Pointer {
+        return uniffiRustCall() { status ->
             UniffiLib.INSTANCE.uniffi_iroh_fn_clone_filterkind(pointer!!, status)
         }
+    }
 
+    
     /**
      * Verifies whether this filter matches a given key
-     */
-    override fun `matches`(`key`: kotlin.ByteArray): kotlin.Boolean =
-        FfiConverterBoolean.lift(
-            callWithPointer {
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_filterkind_matches(
-                        it,
-                        FfiConverterByteArray.lower(`key`),
-                        _status,
-                    )
-                }
-            },
-        )
-
-    companion object {
-        /**
-         * Returns a FilterKind that matches if the contained bytes and the key are the same.
-         */
-        fun `exact`(`key`: kotlin.ByteArray): FilterKind =
-            FfiConverterTypeFilterKind.lift(
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_constructor_filterkind_exact(
-                        FfiConverterByteArray.lower(`key`),
-                        _status,
-                    )
-                },
-            )
-
-        /**
-         * Returns a FilterKind that matches if the contained bytes are a prefix of the key.
-         */
-        fun `prefix`(`prefix`: kotlin.ByteArray): FilterKind =
-            FfiConverterTypeFilterKind.lift(
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_constructor_filterkind_prefix(
-                        FfiConverterByteArray.lower(`prefix`),
-                        _status,
-                    )
-                },
-            )
+     */override fun `matches`(`key`: kotlin.ByteArray): kotlin.Boolean {
+            return FfiConverterBoolean.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_filterkind_matches(
+        it, FfiConverterByteArray.lower(`key`),_status)
+}
     }
+    )
+    }
+    
+
+    
+
+    
+    companion object {
+        
+    /**
+     * Returns a FilterKind that matches if the contained bytes and the key are the same.
+     */ fun `exact`(`key`: kotlin.ByteArray): FilterKind {
+            return FfiConverterTypeFilterKind.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_constructor_filterkind_exact(
+        FfiConverterByteArray.lower(`key`),_status)
+}
+    )
+    }
+    
+
+        
+    /**
+     * Returns a FilterKind that matches if the contained bytes are a prefix of the key.
+     */ fun `prefix`(`prefix`: kotlin.ByteArray): FilterKind {
+            return FfiConverterTypeFilterKind.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_constructor_filterkind_prefix(
+        FfiConverterByteArray.lower(`prefix`),_status)
+}
+    )
+    }
+    
+
+        
+    }
+    
 }
 
-public object FfiConverterTypeFilterKind : FfiConverter<FilterKind, Pointer> {
-    override fun lower(value: FilterKind): Pointer = value.uniffiClonePointer()
+public object FfiConverterTypeFilterKind: FfiConverter<FilterKind, Pointer> {
 
-    override fun lift(value: Pointer): FilterKind = FilterKind(value)
+    override fun lower(value: FilterKind): Pointer {
+        return value.uniffiClonePointer()
+    }
+
+    override fun lift(value: Pointer): FilterKind {
+        return FilterKind(value)
+    }
 
     override fun read(buf: ByteBuffer): FilterKind {
         // The Rust code always writes pointers as 8 bytes, and will
@@ -9674,15 +9128,13 @@ public object FfiConverterTypeFilterKind : FfiConverter<FilterKind, Pointer> {
 
     override fun allocationSize(value: FilterKind) = 8UL
 
-    override fun write(
-        value: FilterKind,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: FilterKind, buf: ByteBuffer) {
         // The Rust code always expects pointers written as 8 bytes,
         // and will fail to compile if they don't fit.
         buf.putLong(Pointer.nativeValue(lower(value)))
     }
 }
+
 
 // This template implements a class for working with a Rust struct via a Pointer/Arc<T>
 // to the live Rust struct on the other side of the FFI.
@@ -9781,35 +9233,35 @@ public object FfiConverterTypeFilterKind : FfiConverter<FilterKind, Pointer> {
 // [1] https://stackoverflow.com/questions/24376768/can-java-finalize-an-object-when-it-is-still-in-scope/24380219
 //
 
+
 /**
  * Hash type used throughout Iroh. A blake3 hash.
  */
 public interface HashInterface {
+    
     /**
      * Returns true if the Hash's have the same value
      */
     fun `equal`(`other`: Hash): kotlin.Boolean
-
+    
     /**
      * Bytes of the hash.
      */
     fun `toBytes`(): kotlin.ByteArray
-
+    
     /**
      * Convert the hash to a hex string.
      */
     fun `toHex`(): kotlin.String
-
+    
     companion object
 }
 
 /**
  * Hash type used throughout Iroh. A blake3 hash.
  */
-open class Hash :
-    Disposable,
-    AutoCloseable,
-    HashInterface {
+open class Hash: Disposable, AutoCloseable, HashInterface {
+
     constructor(pointer: Pointer) {
         this.pointer = pointer
         this.cleanable = UniffiLib.CLEANER.register(this, UniffiCleanAction(pointer))
@@ -9825,19 +9277,16 @@ open class Hash :
         this.pointer = null
         this.cleanable = UniffiLib.CLEANER.register(this, UniffiCleanAction(pointer))
     }
-
     /**
      * Calculate the hash of the provide bytes.
      */
     constructor(`buf`: kotlin.ByteArray) :
         this(
-            uniffiRustCall { _status ->
-                UniffiLib.INSTANCE.uniffi_iroh_fn_constructor_hash_new(
-                    FfiConverterByteArray.lower(`buf`),
-                    _status,
-                )
-            },
-        )
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_constructor_hash_new(
+        FfiConverterByteArray.lower(`buf`),_status)
+}
+    )
 
     protected val pointer: Pointer?
     protected val cleanable: UniffiCleaner.Cleanable
@@ -9872,7 +9321,7 @@ open class Hash :
             if (c == Long.MAX_VALUE) {
                 throw IllegalStateException("${this.javaClass.simpleName} call counter would overflow")
             }
-        } while (!this.callCounter.compareAndSet(c, c + 1L))
+        } while (! this.callCounter.compareAndSet(c, c + 1L))
         // Now we can safely do the method call without the pointer being freed concurrently.
         try {
             return block(this.uniffiClonePointer())
@@ -9886,9 +9335,7 @@ open class Hash :
 
     // Use a static inner class instead of a closure so as not to accidentally
     // capture `this` as part of the cleanable's action.
-    private class UniffiCleanAction(
-        private val pointer: Pointer?,
-    ) : Runnable {
+    private class UniffiCleanAction(private val pointer: Pointer?) : Runnable {
         override fun run() {
             pointer?.let { ptr ->
                 uniffiRustCall { status ->
@@ -9898,104 +9345,114 @@ open class Hash :
         }
     }
 
-    fun uniffiClonePointer(): Pointer =
-        uniffiRustCall { status ->
+    fun uniffiClonePointer(): Pointer {
+        return uniffiRustCall() { status ->
             UniffiLib.INSTANCE.uniffi_iroh_fn_clone_hash(pointer!!, status)
         }
+    }
 
+    
     /**
      * Returns true if the Hash's have the same value
-     */
-    override fun `equal`(`other`: Hash): kotlin.Boolean =
-        FfiConverterBoolean.lift(
-            callWithPointer {
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_hash_equal(
-                        it,
-                        FfiConverterTypeHash.lower(`other`),
-                        _status,
-                    )
-                }
-            },
-        )
+     */override fun `equal`(`other`: Hash): kotlin.Boolean {
+            return FfiConverterBoolean.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_hash_equal(
+        it, FfiConverterTypeHash.lower(`other`),_status)
+}
+    }
+    )
+    }
+    
 
+    
     /**
      * Bytes of the hash.
-     */
-    override fun `toBytes`(): kotlin.ByteArray =
-        FfiConverterByteArray.lift(
-            callWithPointer {
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_hash_to_bytes(
-                        it,
-                        _status,
-                    )
-                }
-            },
-        )
+     */override fun `toBytes`(): kotlin.ByteArray {
+            return FfiConverterByteArray.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_hash_to_bytes(
+        it, _status)
+}
+    }
+    )
+    }
+    
 
+    
     /**
      * Convert the hash to a hex string.
-     */
-    override fun `toHex`(): kotlin.String =
-        FfiConverterString.lift(
-            callWithPointer {
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_hash_to_hex(
-                        it,
-                        _status,
-                    )
-                }
-            },
-        )
-
-    override fun toString(): String =
-        FfiConverterString.lift(
-            callWithPointer {
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_hash_uniffi_trait_display(
-                        it,
-                        _status,
-                    )
-                }
-            },
-        )
-
-    companion object {
-        /**
-         * Create a Hash from its raw bytes representation.
-         */
-        @Throws(IrohException::class)
-        fun `fromBytes`(`bytes`: kotlin.ByteArray): Hash =
-            FfiConverterTypeHash.lift(
-                uniffiRustCallWithError(IrohException) { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_constructor_hash_from_bytes(
-                        FfiConverterByteArray.lower(`bytes`),
-                        _status,
-                    )
-                },
-            )
-
-        /**
-         * Make a Hash from hex string
-         */
-        @Throws(IrohException::class)
-        fun `fromString`(`s`: kotlin.String): Hash =
-            FfiConverterTypeHash.lift(
-                uniffiRustCallWithError(IrohException) { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_constructor_hash_from_string(
-                        FfiConverterString.lower(`s`),
-                        _status,
-                    )
-                },
-            )
+     */override fun `toHex`(): kotlin.String {
+            return FfiConverterString.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_hash_to_hex(
+        it, _status)
+}
     }
+    )
+    }
+    
+
+    
+    override fun toString(): String {
+        return FfiConverterString.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_hash_uniffi_trait_display(
+        it, _status)
+}
+    }
+    )
+    }
+    
+
+    
+    companion object {
+        
+    /**
+     * Create a Hash from its raw bytes representation.
+     */
+    @Throws(IrohException::class) fun `fromBytes`(`bytes`: kotlin.ByteArray): Hash {
+            return FfiConverterTypeHash.lift(
+    uniffiRustCallWithError(IrohException) { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_constructor_hash_from_bytes(
+        FfiConverterByteArray.lower(`bytes`),_status)
+}
+    )
+    }
+    
+
+        
+    /**
+     * Make a Hash from hex string
+     */
+    @Throws(IrohException::class) fun `fromString`(`s`: kotlin.String): Hash {
+            return FfiConverterTypeHash.lift(
+    uniffiRustCallWithError(IrohException) { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_constructor_hash_from_string(
+        FfiConverterString.lower(`s`),_status)
+}
+    )
+    }
+    
+
+        
+    }
+    
 }
 
-public object FfiConverterTypeHash : FfiConverter<Hash, Pointer> {
-    override fun lower(value: Hash): Pointer = value.uniffiClonePointer()
+public object FfiConverterTypeHash: FfiConverter<Hash, Pointer> {
 
-    override fun lift(value: Pointer): Hash = Hash(value)
+    override fun lower(value: Hash): Pointer {
+        return value.uniffiClonePointer()
+    }
+
+    override fun lift(value: Pointer): Hash {
+        return Hash(value)
+    }
 
     override fun read(buf: ByteBuffer): Hash {
         // The Rust code always writes pointers as 8 bytes, and will
@@ -10005,15 +9462,13 @@ public object FfiConverterTypeHash : FfiConverter<Hash, Pointer> {
 
     override fun allocationSize(value: Hash) = 8UL
 
-    override fun write(
-        value: Hash,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: Hash, buf: ByteBuffer) {
         // The Rust code always expects pointers written as 8 bytes,
         // and will fail to compile if they don't fit.
         buf.putLong(Pointer.nativeValue(lower(value)))
     }
 }
+
 
 // This template implements a class for working with a Rust struct via a Pointer/Arc<T>
 // to the live Rust struct on the other side of the FFI.
@@ -10112,12 +9567,14 @@ public object FfiConverterTypeHash : FfiConverter<Hash, Pointer> {
 // [1] https://stackoverflow.com/questions/24376768/can-java-finalize-an-object-when-it-is-still-in-scope/24380219
 //
 
+
 /**
  * An iroh error.
  */
 public interface IrohExceptionInterface {
+    
     fun `message`(): kotlin.String
-
+    
     companion object
 }
 
@@ -10125,11 +9582,9 @@ public interface IrohExceptionInterface {
  * An iroh error.
  */
 
-open class IrohException :
-    kotlin.Exception,
-    Disposable,
-    AutoCloseable,
-    IrohExceptionInterface {
+open class IrohException : kotlin.Exception, Disposable, AutoCloseable, IrohExceptionInterface {
+
+
     constructor(pointer: Pointer) {
         this.pointer = pointer
         this.cleanable = UniffiLib.CLEANER.register(this, UniffiCleanAction(pointer))
@@ -10179,7 +9634,7 @@ open class IrohException :
             if (c == Long.MAX_VALUE) {
                 throw IllegalStateException("${this.javaClass.simpleName} call counter would overflow")
             }
-        } while (!this.callCounter.compareAndSet(c, c + 1L))
+        } while (! this.callCounter.compareAndSet(c, c + 1L))
         // Now we can safely do the method call without the pointer being freed concurrently.
         try {
             return block(this.uniffiClonePointer())
@@ -10193,9 +9648,7 @@ open class IrohException :
 
     // Use a static inner class instead of a closure so as not to accidentally
     // capture `this` as part of the cleanable's action.
-    private class UniffiCleanAction(
-        private val pointer: Pointer?,
-    ) : Runnable {
+    private class UniffiCleanAction(private val pointer: Pointer?) : Runnable {
         override fun run() {
             pointer?.let { ptr ->
                 uniffiRustCall { status ->
@@ -10205,23 +9658,28 @@ open class IrohException :
         }
     }
 
-    fun uniffiClonePointer(): Pointer =
-        uniffiRustCall { status ->
+    fun uniffiClonePointer(): Pointer {
+        return uniffiRustCall() { status ->
             UniffiLib.INSTANCE.uniffi_iroh_fn_clone_iroherror(pointer!!, status)
         }
+    }
 
-    override fun `message`(): kotlin.String =
-        FfiConverterString.lift(
-            callWithPointer {
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_iroherror_message(
-                        it,
-                        _status,
-                    )
-                }
-            },
-        )
+    override fun `message`(): kotlin.String {
+            return FfiConverterString.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_iroherror_message(
+        it, _status)
+}
+    }
+    )
+    }
+    
 
+    
+
+    
+    
     companion object ErrorHandler : UniffiRustCallStatusErrorHandler<IrohException> {
         override fun lift(error_buf: RustBuffer.ByValue): IrohException {
             // Due to some mismatches in the ffi converter mechanisms, errors are a RustBuffer.
@@ -10232,12 +9690,18 @@ open class IrohException :
             return FfiConverterTypeIrohError.read(bb)
         }
     }
+    
 }
 
-public object FfiConverterTypeIrohError : FfiConverter<IrohException, Pointer> {
-    override fun lower(value: IrohException): Pointer = value.uniffiClonePointer()
+public object FfiConverterTypeIrohError: FfiConverter<IrohException, Pointer> {
 
-    override fun lift(value: Pointer): IrohException = IrohException(value)
+    override fun lower(value: IrohException): Pointer {
+        return value.uniffiClonePointer()
+    }
+
+    override fun lift(value: Pointer): IrohException {
+        return IrohException(value)
+    }
 
     override fun read(buf: ByteBuffer): IrohException {
         // The Rust code always writes pointers as 8 bytes, and will
@@ -10247,15 +9711,13 @@ public object FfiConverterTypeIrohError : FfiConverter<IrohException, Pointer> {
 
     override fun allocationSize(value: IrohException) = 8UL
 
-    override fun write(
-        value: IrohException,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: IrohException, buf: ByteBuffer) {
         // The Rust code always expects pointers written as 8 bytes,
         // and will fail to compile if they don't fit.
         buf.putLong(Pointer.nativeValue(lower(value)))
     }
 }
+
 
 // This template implements a class for working with a Rust struct via a Pointer/Arc<T>
 // to the live Rust struct on the other side of the FFI.
@@ -10354,10 +9816,12 @@ public object FfiConverterTypeIrohError : FfiConverter<IrohException, Pointer> {
 // [1] https://stackoverflow.com/questions/24376768/can-java-finalize-an-object-when-it-is-still-in-scope/24380219
 //
 
+
 /**
  * An Iroh node. Allows you to sync, store, and transfer data.
  */
 public interface IrohNodeInterface {
+    
     /**
      * Create a new document author.
      *
@@ -10367,7 +9831,7 @@ public interface IrohNodeInterface {
      * If you need only a single author, use [`Self::default`].
      */
     fun `authorCreate`(): AuthorId
-
+    
     /**
      * Returns the default document author of this node.
      *
@@ -10377,35 +9841,35 @@ public interface IrohNodeInterface {
      * The default author can be set with [`Self::set_default`].
      */
     fun `authorDefault`(): AuthorId
-
+    
     /**
      * Deletes the given author by id.
      *
      * Warning: This permanently removes this author.
      */
     fun `authorDelete`(`author`: AuthorId)
-
+    
     /**
      * Export the given author.
      *
      * Warning: This contains sensitive data.
      */
     fun `authorExport`(`author`: AuthorId): Author
-
+    
     /**
      * Import the given author.
      *
      * Warning: This contains sensitive data.
      */
     fun `authorImport`(`author`: Author): AuthorId
-
+    
     fun `authorList`(): List<AuthorId>
-
+    
     /**
      * Write a blob by passing bytes.
      */
     fun `blobsAddBytes`(`bytes`: kotlin.ByteArray): BlobAddOutcome
-
+    
     /**
      * Import a blob from a filesystem path.
      *
@@ -10414,55 +9878,36 @@ public interface IrohNodeInterface {
      * If `in_place` is true, Iroh will assume that the data will not change and will share it in
      * place without copying to the Iroh data directory.
      */
-    fun `blobsAddFromPath`(
-        `path`: kotlin.String,
-        `inPlace`: kotlin.Boolean,
-        `tag`: SetTagOption,
-        `wrap`: WrapOption,
-        `cb`: AddCallback,
-    )
-
+    fun `blobsAddFromPath`(`path`: kotlin.String, `inPlace`: kotlin.Boolean, `tag`: SetTagOption, `wrap`: WrapOption, `cb`: AddCallback)
+    
     /**
      * Create a collection from already existing blobs.
      *
      * To automatically clear the tags for the passed in blobs you can set
      * `tags_to_delete` on those tags, and they will be deleted once the collection is created.
      */
-    fun `blobsCreateCollection`(
-        `collection`: Collection,
-        `tag`: SetTagOption,
-        `tagsToDelete`: List<kotlin.String>,
-    ): HashAndTag
-
+    fun `blobsCreateCollection`(`collection`: Collection, `tag`: SetTagOption, `tagsToDelete`: List<kotlin.String>): HashAndTag
+    
     /**
      * Delete a blob.
      */
     fun `blobsDeleteBlob`(`hash`: Hash)
-
+    
     /**
      * Download a blob from another node and add it to the local database.
      */
-    fun `blobsDownload`(
-        `hash`: Hash,
-        `req`: BlobDownloadOptions,
-        `cb`: DownloadCallback,
-    )
-
+    fun `blobsDownload`(`hash`: Hash, `req`: BlobDownloadOptions, `cb`: DownloadCallback)
+    
     /**
      * Download a blob from another node and add it to the local database.
      */
-    fun `blobsExport`(
-        `hash`: Hash,
-        `destination`: kotlin.String,
-        `format`: BlobExportFormat,
-        `mode`: BlobExportMode,
-    )
-
+    fun `blobsExport`(`hash`: Hash, `destination`: kotlin.String, `format`: BlobExportFormat, `mode`: BlobExportMode)
+    
     /**
      * Read the content of a collection
      */
     fun `blobsGetCollection`(`hash`: Hash): Collection
-
+    
     /**
      * List all complete blobs.
      *
@@ -10470,7 +9915,7 @@ public interface IrohNodeInterface {
      * Please file an [issue](https://github.com/n0-computer/iroh-ffi/issues/new) if you run into this issue
      */
     fun `blobsList`(): List<Hash>
-
+    
     /**
      * List all collections.
      *
@@ -10478,7 +9923,7 @@ public interface IrohNodeInterface {
      * Please file an [issue](https://github.com/n0-computer/iroh-ffi/issues/new) if you run into this issue
      */
     fun `blobsListCollections`(): List<CollectionInfo>
-
+    
     /**
      * List all incomplete (partial) blobs.
      *
@@ -10486,7 +9931,7 @@ public interface IrohNodeInterface {
      * Please file an [issue](https://github.com/n0-computer/iroh-ffi/issues/new) if you run into this issue
      */
     fun `blobsListIncomplete`(): List<IncompleteBlobInfo>
-
+    
     /**
      * Read all bytes of single blob at `offset` for length `len`.
      *
@@ -10494,12 +9939,8 @@ public interface IrohNodeInterface {
      * reading is small. If not sure, use [`Self::blobs_size`] and check the size with
      * before calling [`Self::blobs_read_at_to_bytes`].
      */
-    fun `blobsReadAtToBytes`(
-        `hash`: Hash,
-        `offset`: kotlin.ULong,
-        `len`: kotlin.ULong?,
-    ): kotlin.ByteArray
-
+    fun `blobsReadAtToBytes`(`hash`: Hash, `offset`: kotlin.ULong, `len`: kotlin.ULong?): kotlin.ByteArray
+    
     /**
      * Read all bytes of single blob.
      *
@@ -10508,42 +9949,35 @@ public interface IrohNodeInterface {
      * before calling [`Self::blobs_read_to_bytes`].
      */
     fun `blobsReadToBytes`(`hash`: Hash): kotlin.ByteArray
-
+    
     /**
      * Create a ticket for sharing a blob or collection from this node.
      */
-    fun `blobsShare`(
-        `hash`: Hash,
-        `blobFormat`: BlobFormat,
-        `ticketOptions`: AddrInfoOptions,
-    ): kotlin.String
-
+    fun `blobsShare`(`hash`: Hash, `blobFormat`: BlobFormat, `ticketOptions`: AddrInfoOptions): kotlin.String
+    
     /**
      * Get the size information on a single blob.
      */
     fun `blobsSize`(`hash`: Hash): kotlin.ULong
-
+    
     /**
      * Export the blob contents to a file path
      * The `path` field is expected to be the absolute path.
      */
-    fun `blobsWriteToPath`(
-        `hash`: Hash,
-        `path`: kotlin.String,
-    )
-
+    fun `blobsWriteToPath`(`hash`: Hash, `path`: kotlin.String)
+    
     fun `connectionInfo`(`nodeId`: PublicKey): ConnectionInfo?
-
+    
     /**
      * Return `ConnectionInfo`s for each connection we have to another iroh node.
      */
     fun `connections`(): List<ConnectionInfo>
-
+    
     /**
      * Create a new doc.
      */
     fun `docCreate`(): Doc
-
+    
     /**
      * Delete a document from the local node.
      *
@@ -10552,52 +9986,49 @@ public interface IrohNodeInterface {
      * deleted through garbage collection unless they are referenced from another document or tag.
      */
     fun `docDrop`(`docId`: kotlin.String)
-
+    
     /**
      * Join and sync with an already existing document.
      */
     fun `docJoin`(`ticket`: kotlin.String): Doc
-
+    
     /**
      * Join and sync with an already existing document and subscribe to events on that document.
      */
-    fun `docJoinAndSubscribe`(
-        `ticket`: kotlin.String,
-        `cb`: SubscribeCallback,
-    ): Doc
-
+    fun `docJoinAndSubscribe`(`ticket`: kotlin.String, `cb`: SubscribeCallback): Doc
+    
     /**
      * List all the docs we have access to on this node.
      */
     fun `docList`(): List<NamespaceAndCapability>
-
+    
     /**
      * Get a [`Doc`].
      *
      * Returns None if the document cannot be found.
      */
     fun `docOpen`(`id`: kotlin.String): Doc?
-
+    
     /**
      * The string representation of the PublicKey of this node.
      */
     fun `nodeId`(): kotlin.String
-
+    
     /**
      * Get statistics of the running node.
      */
     fun `stats`(): Map<kotlin.String, CounterStats>
-
+    
     /**
      * Get status information about a node
      */
     fun `status`(): NodeStatus
-
+    
     /**
      * Delete a tag.
      */
     fun `tagsDelete`(`name`: kotlin.ByteArray)
-
+    
     /**
      * List all tags
      *
@@ -10605,17 +10036,15 @@ public interface IrohNodeInterface {
      * Please file an [issue](https://github.com/n0-computer/iroh-ffi/issues/new) if you run into this issue
      */
     fun `tagsList`(): List<TagInfo>
-
+    
     companion object
 }
 
 /**
  * An Iroh node. Allows you to sync, store, and transfer data.
  */
-open class IrohNode :
-    Disposable,
-    AutoCloseable,
-    IrohNodeInterface {
+open class IrohNode: Disposable, AutoCloseable, IrohNodeInterface {
+
     constructor(pointer: Pointer) {
         this.pointer = pointer
         this.cleanable = UniffiLib.CLEANER.register(this, UniffiCleanAction(pointer))
@@ -10631,20 +10060,7 @@ open class IrohNode :
         this.pointer = null
         this.cleanable = UniffiLib.CLEANER.register(this, UniffiCleanAction(pointer))
     }
-
-    /**
-     * Create a new iroh node. The `path` param should be a directory where we can store or load
-     * iroh data from a previous session.
-     */
-    constructor(`path`: kotlin.String) :
-        this(
-            uniffiRustCallWithError(IrohException) { _status ->
-                UniffiLib.INSTANCE.uniffi_iroh_fn_constructor_irohnode_new(
-                    FfiConverterString.lower(`path`),
-                    _status,
-                )
-            },
-        )
+    // Note no constructor generated for this object as it is async.
 
     protected val pointer: Pointer?
     protected val cleanable: UniffiCleaner.Cleanable
@@ -10679,7 +10095,7 @@ open class IrohNode :
             if (c == Long.MAX_VALUE) {
                 throw IllegalStateException("${this.javaClass.simpleName} call counter would overflow")
             }
-        } while (!this.callCounter.compareAndSet(c, c + 1L))
+        } while (! this.callCounter.compareAndSet(c, c + 1L))
         // Now we can safely do the method call without the pointer being freed concurrently.
         try {
             return block(this.uniffiClonePointer())
@@ -10693,9 +10109,7 @@ open class IrohNode :
 
     // Use a static inner class instead of a closure so as not to accidentally
     // capture `this` as part of the cleanable's action.
-    private class UniffiCleanAction(
-        private val pointer: Pointer?,
-    ) : Runnable {
+    private class UniffiCleanAction(private val pointer: Pointer?) : Runnable {
         override fun run() {
             pointer?.let { ptr ->
                 uniffiRustCall { status ->
@@ -10705,11 +10119,13 @@ open class IrohNode :
         }
     }
 
-    fun uniffiClonePointer(): Pointer =
-        uniffiRustCall { status ->
+    fun uniffiClonePointer(): Pointer {
+        return uniffiRustCall() { status ->
             UniffiLib.INSTANCE.uniffi_iroh_fn_clone_irohnode(pointer!!, status)
         }
+    }
 
+    
     /**
      * Create a new document author.
      *
@@ -10718,21 +10134,19 @@ open class IrohNode :
      *
      * If you need only a single author, use [`Self::default`].
      */
-    @Throws(
-        IrohException::class,
-        )
-    override fun `authorCreate`(): AuthorId =
-        FfiConverterTypeAuthorId.lift(
-            callWithPointer {
-                uniffiRustCallWithError(IrohException) { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_irohnode_author_create(
-                        it,
-                        _status,
-                    )
-                }
-            },
-        )
+    @Throws(IrohException::class)override fun `authorCreate`(): AuthorId {
+            return FfiConverterTypeAuthorId.lift(
+    callWithPointer {
+    uniffiRustCallWithError(IrohException) { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_irohnode_author_create(
+        it, _status)
+}
+    }
+    )
+    }
+    
 
+    
     /**
      * Returns the default document author of this node.
      *
@@ -10741,116 +10155,101 @@ open class IrohNode :
      *
      * The default author can be set with [`Self::set_default`].
      */
-    @Throws(
-        IrohException::class,
-        )
-    override fun `authorDefault`(): AuthorId =
-        FfiConverterTypeAuthorId.lift(
-            callWithPointer {
-                uniffiRustCallWithError(IrohException) { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_irohnode_author_default(
-                        it,
-                        _status,
-                    )
-                }
-            },
-        )
+    @Throws(IrohException::class)override fun `authorDefault`(): AuthorId {
+            return FfiConverterTypeAuthorId.lift(
+    callWithPointer {
+    uniffiRustCallWithError(IrohException) { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_irohnode_author_default(
+        it, _status)
+}
+    }
+    )
+    }
+    
 
+    
     /**
      * Deletes the given author by id.
      *
      * Warning: This permanently removes this author.
      */
-    @Throws(
-        IrohException::class,
-        )
-    override fun `authorDelete`(`author`: AuthorId) =
-        callWithPointer {
-            uniffiRustCallWithError(IrohException) { _status ->
-                UniffiLib.INSTANCE.uniffi_iroh_fn_method_irohnode_author_delete(
-                    it,
-                    FfiConverterTypeAuthorId.lower(`author`),
-                    _status,
-                )
-            }
-        }
+    @Throws(IrohException::class)override fun `authorDelete`(`author`: AuthorId)
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(IrohException) { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_irohnode_author_delete(
+        it, FfiConverterTypeAuthorId.lower(`author`),_status)
+}
+    }
+    
+    
 
+    
     /**
      * Export the given author.
      *
      * Warning: This contains sensitive data.
      */
-    @Throws(
-        IrohException::class,
-        )
-    override fun `authorExport`(`author`: AuthorId): Author =
-        FfiConverterTypeAuthor.lift(
-            callWithPointer {
-                uniffiRustCallWithError(IrohException) { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_irohnode_author_export(
-                        it,
-                        FfiConverterTypeAuthorId.lower(`author`),
-                        _status,
-                    )
-                }
-            },
-        )
+    @Throws(IrohException::class)override fun `authorExport`(`author`: AuthorId): Author {
+            return FfiConverterTypeAuthor.lift(
+    callWithPointer {
+    uniffiRustCallWithError(IrohException) { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_irohnode_author_export(
+        it, FfiConverterTypeAuthorId.lower(`author`),_status)
+}
+    }
+    )
+    }
+    
 
+    
     /**
      * Import the given author.
      *
      * Warning: This contains sensitive data.
      */
-    @Throws(
-        IrohException::class,
-        )
-    override fun `authorImport`(`author`: Author): AuthorId =
-        FfiConverterTypeAuthorId.lift(
-            callWithPointer {
-                uniffiRustCallWithError(IrohException) { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_irohnode_author_import(
-                        it,
-                        FfiConverterTypeAuthor.lower(`author`),
-                        _status,
-                    )
-                }
-            },
-        )
+    @Throws(IrohException::class)override fun `authorImport`(`author`: Author): AuthorId {
+            return FfiConverterTypeAuthorId.lift(
+    callWithPointer {
+    uniffiRustCallWithError(IrohException) { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_irohnode_author_import(
+        it, FfiConverterTypeAuthor.lower(`author`),_status)
+}
+    }
+    )
+    }
+    
 
-    @Throws(
-        IrohException::class,
-        )
-    override fun `authorList`(): List<AuthorId> =
-        FfiConverterSequenceTypeAuthorId.lift(
-            callWithPointer {
-                uniffiRustCallWithError(IrohException) { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_irohnode_author_list(
-                        it,
-                        _status,
-                    )
-                }
-            },
-        )
+    
+    @Throws(IrohException::class)override fun `authorList`(): List<AuthorId> {
+            return FfiConverterSequenceTypeAuthorId.lift(
+    callWithPointer {
+    uniffiRustCallWithError(IrohException) { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_irohnode_author_list(
+        it, _status)
+}
+    }
+    )
+    }
+    
 
+    
     /**
      * Write a blob by passing bytes.
      */
-    @Throws(
-        IrohException::class,
-        )
-    override fun `blobsAddBytes`(`bytes`: kotlin.ByteArray): BlobAddOutcome =
-        FfiConverterTypeBlobAddOutcome.lift(
-            callWithPointer {
-                uniffiRustCallWithError(IrohException) { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_irohnode_blobs_add_bytes(
-                        it,
-                        FfiConverterByteArray.lower(`bytes`),
-                        _status,
-                    )
-                }
-            },
-        )
+    @Throws(IrohException::class)override fun `blobsAddBytes`(`bytes`: kotlin.ByteArray): BlobAddOutcome {
+            return FfiConverterTypeBlobAddOutcome.lift(
+    callWithPointer {
+    uniffiRustCallWithError(IrohException) { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_irohnode_blobs_add_bytes(
+        it, FfiConverterByteArray.lower(`bytes`),_status)
+}
+    }
+    )
+    }
+    
 
+    
     /**
      * Import a blob from a filesystem path.
      *
@@ -10859,202 +10258,155 @@ open class IrohNode :
      * If `in_place` is true, Iroh will assume that the data will not change and will share it in
      * place without copying to the Iroh data directory.
      */
-    @Throws(
-        IrohException::class,
-        )
-    override fun `blobsAddFromPath`(
-        `path`: kotlin.String,
-        `inPlace`: kotlin.Boolean,
-        `tag`: SetTagOption,
-        `wrap`: WrapOption,
-        `cb`: AddCallback,
-    ) = callWithPointer {
-        uniffiRustCallWithError(IrohException) { _status ->
-            UniffiLib.INSTANCE.uniffi_iroh_fn_method_irohnode_blobs_add_from_path(
-                it,
-                FfiConverterString.lower(`path`),
-                FfiConverterBoolean.lower(`inPlace`),
-                FfiConverterTypeSetTagOption.lower(`tag`),
-                FfiConverterTypeWrapOption.lower(`wrap`),
-                FfiConverterTypeAddCallback.lower(`cb`),
-                _status,
-            )
-        }
+    @Throws(IrohException::class)override fun `blobsAddFromPath`(`path`: kotlin.String, `inPlace`: kotlin.Boolean, `tag`: SetTagOption, `wrap`: WrapOption, `cb`: AddCallback)
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(IrohException) { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_irohnode_blobs_add_from_path(
+        it, FfiConverterString.lower(`path`),FfiConverterBoolean.lower(`inPlace`),FfiConverterTypeSetTagOption.lower(`tag`),FfiConverterTypeWrapOption.lower(`wrap`),FfiConverterTypeAddCallback.lower(`cb`),_status)
+}
     }
+    
+    
 
+    
     /**
      * Create a collection from already existing blobs.
      *
      * To automatically clear the tags for the passed in blobs you can set
      * `tags_to_delete` on those tags, and they will be deleted once the collection is created.
      */
-    @Throws(
-        IrohException::class,
-        )
-    override fun `blobsCreateCollection`(
-        `collection`: Collection,
-        `tag`: SetTagOption,
-        `tagsToDelete`: List<kotlin.String>,
-    ): HashAndTag =
-        FfiConverterTypeHashAndTag.lift(
-            callWithPointer {
-                uniffiRustCallWithError(IrohException) { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_irohnode_blobs_create_collection(
-                        it,
-                        FfiConverterTypeCollection.lower(`collection`),
-                        FfiConverterTypeSetTagOption.lower(`tag`),
-                        FfiConverterSequenceString.lower(`tagsToDelete`),
-                        _status,
-                    )
-                }
-            },
-        )
+    @Throws(IrohException::class)override fun `blobsCreateCollection`(`collection`: Collection, `tag`: SetTagOption, `tagsToDelete`: List<kotlin.String>): HashAndTag {
+            return FfiConverterTypeHashAndTag.lift(
+    callWithPointer {
+    uniffiRustCallWithError(IrohException) { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_irohnode_blobs_create_collection(
+        it, FfiConverterTypeCollection.lower(`collection`),FfiConverterTypeSetTagOption.lower(`tag`),FfiConverterSequenceString.lower(`tagsToDelete`),_status)
+}
+    }
+    )
+    }
+    
 
+    
     /**
      * Delete a blob.
      */
-    @Throws(
-        IrohException::class,
-        )
-    override fun `blobsDeleteBlob`(`hash`: Hash) =
-        callWithPointer {
-            uniffiRustCallWithError(IrohException) { _status ->
-                UniffiLib.INSTANCE.uniffi_iroh_fn_method_irohnode_blobs_delete_blob(
-                    it,
-                    FfiConverterTypeHash.lower(`hash`),
-                    _status,
-                )
-            }
-        }
+    @Throws(IrohException::class)override fun `blobsDeleteBlob`(`hash`: Hash)
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(IrohException) { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_irohnode_blobs_delete_blob(
+        it, FfiConverterTypeHash.lower(`hash`),_status)
+}
+    }
+    
+    
 
+    
     /**
      * Download a blob from another node and add it to the local database.
      */
-    @Throws(
-        IrohException::class,
-        )
-    override fun `blobsDownload`(
-        `hash`: Hash,
-        `req`: BlobDownloadOptions,
-        `cb`: DownloadCallback,
-    ) = callWithPointer {
-        uniffiRustCallWithError(IrohException) { _status ->
-            UniffiLib.INSTANCE.uniffi_iroh_fn_method_irohnode_blobs_download(
-                it,
-                FfiConverterTypeHash.lower(`hash`),
-                FfiConverterTypeBlobDownloadOptions.lower(`req`),
-                FfiConverterTypeDownloadCallback.lower(`cb`),
-                _status,
-            )
-        }
+    @Throws(IrohException::class)override fun `blobsDownload`(`hash`: Hash, `req`: BlobDownloadOptions, `cb`: DownloadCallback)
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(IrohException) { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_irohnode_blobs_download(
+        it, FfiConverterTypeHash.lower(`hash`),FfiConverterTypeBlobDownloadOptions.lower(`req`),FfiConverterTypeDownloadCallback.lower(`cb`),_status)
+}
     }
+    
+    
 
+    
     /**
      * Download a blob from another node and add it to the local database.
      */
-    @Throws(
-        IrohException::class,
-        )
-    override fun `blobsExport`(
-        `hash`: Hash,
-        `destination`: kotlin.String,
-        `format`: BlobExportFormat,
-        `mode`: BlobExportMode,
-    ) = callWithPointer {
-        uniffiRustCallWithError(IrohException) { _status ->
-            UniffiLib.INSTANCE.uniffi_iroh_fn_method_irohnode_blobs_export(
-                it,
-                FfiConverterTypeHash.lower(`hash`),
-                FfiConverterString.lower(`destination`),
-                FfiConverterTypeBlobExportFormat.lower(`format`),
-                FfiConverterTypeBlobExportMode.lower(`mode`),
-                _status,
-            )
-        }
+    @Throws(IrohException::class)override fun `blobsExport`(`hash`: Hash, `destination`: kotlin.String, `format`: BlobExportFormat, `mode`: BlobExportMode)
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(IrohException) { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_irohnode_blobs_export(
+        it, FfiConverterTypeHash.lower(`hash`),FfiConverterString.lower(`destination`),FfiConverterTypeBlobExportFormat.lower(`format`),FfiConverterTypeBlobExportMode.lower(`mode`),_status)
+}
     }
+    
+    
 
+    
     /**
      * Read the content of a collection
      */
-    @Throws(
-        IrohException::class,
-        )
-    override fun `blobsGetCollection`(`hash`: Hash): Collection =
-        FfiConverterTypeCollection.lift(
-            callWithPointer {
-                uniffiRustCallWithError(IrohException) { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_irohnode_blobs_get_collection(
-                        it,
-                        FfiConverterTypeHash.lower(`hash`),
-                        _status,
-                    )
-                }
-            },
-        )
+    @Throws(IrohException::class)override fun `blobsGetCollection`(`hash`: Hash): Collection {
+            return FfiConverterTypeCollection.lift(
+    callWithPointer {
+    uniffiRustCallWithError(IrohException) { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_irohnode_blobs_get_collection(
+        it, FfiConverterTypeHash.lower(`hash`),_status)
+}
+    }
+    )
+    }
+    
 
+    
     /**
      * List all complete blobs.
      *
      * Note: this allocates for each `BlobInfo`, if you have many `BlobInfo`s this may be a prohibitively large list.
      * Please file an [issue](https://github.com/n0-computer/iroh-ffi/issues/new) if you run into this issue
      */
-    @Throws(
-        IrohException::class,
-        )
-    override fun `blobsList`(): List<Hash> =
-        FfiConverterSequenceTypeHash.lift(
-            callWithPointer {
-                uniffiRustCallWithError(IrohException) { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_irohnode_blobs_list(
-                        it,
-                        _status,
-                    )
-                }
-            },
-        )
+    @Throws(IrohException::class)override fun `blobsList`(): List<Hash> {
+            return FfiConverterSequenceTypeHash.lift(
+    callWithPointer {
+    uniffiRustCallWithError(IrohException) { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_irohnode_blobs_list(
+        it, _status)
+}
+    }
+    )
+    }
+    
 
+    
     /**
      * List all collections.
      *
      * Note: this allocates for each `CollectionInfo`, if you have many `CollectionInfo`s this may be a prohibitively large list.
      * Please file an [issue](https://github.com/n0-computer/iroh-ffi/issues/new) if you run into this issue
      */
-    @Throws(
-        IrohException::class,
-        )
-    override fun `blobsListCollections`(): List<CollectionInfo> =
-        FfiConverterSequenceTypeCollectionInfo.lift(
-            callWithPointer {
-                uniffiRustCallWithError(IrohException) { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_irohnode_blobs_list_collections(
-                        it,
-                        _status,
-                    )
-                }
-            },
-        )
+    @Throws(IrohException::class)override fun `blobsListCollections`(): List<CollectionInfo> {
+            return FfiConverterSequenceTypeCollectionInfo.lift(
+    callWithPointer {
+    uniffiRustCallWithError(IrohException) { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_irohnode_blobs_list_collections(
+        it, _status)
+}
+    }
+    )
+    }
+    
 
+    
     /**
      * List all incomplete (partial) blobs.
      *
      * Note: this allocates for each `IncompleteBlobInfo`, if you have many `IncompleteBlobInfo`s this may be a prohibitively large list.
      * Please file an [issue](https://github.com/n0-computer/iroh-ffi/issues/new) if you run into this issue
      */
-    @Throws(
-        IrohException::class,
-        )
-    override fun `blobsListIncomplete`(): List<IncompleteBlobInfo> =
-        FfiConverterSequenceTypeIncompleteBlobInfo.lift(
-            callWithPointer {
-                uniffiRustCallWithError(IrohException) { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_irohnode_blobs_list_incomplete(
-                        it,
-                        _status,
-                    )
-                }
-            },
-        )
+    @Throws(IrohException::class)override fun `blobsListIncomplete`(): List<IncompleteBlobInfo> {
+            return FfiConverterSequenceTypeIncompleteBlobInfo.lift(
+    callWithPointer {
+    uniffiRustCallWithError(IrohException) { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_irohnode_blobs_list_incomplete(
+        it, _status)
+}
+    }
+    )
+    }
+    
 
+    
     /**
      * Read all bytes of single blob at `offset` for length `len`.
      *
@@ -11062,28 +10414,19 @@ open class IrohNode :
      * reading is small. If not sure, use [`Self::blobs_size`] and check the size with
      * before calling [`Self::blobs_read_at_to_bytes`].
      */
-    @Throws(
-        IrohException::class,
-        )
-    override fun `blobsReadAtToBytes`(
-        `hash`: Hash,
-        `offset`: kotlin.ULong,
-        `len`: kotlin.ULong?,
-    ): kotlin.ByteArray =
-        FfiConverterByteArray.lift(
-            callWithPointer {
-                uniffiRustCallWithError(IrohException) { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_irohnode_blobs_read_at_to_bytes(
-                        it,
-                        FfiConverterTypeHash.lower(`hash`),
-                        FfiConverterULong.lower(`offset`),
-                        FfiConverterOptionalULong.lower(`len`),
-                        _status,
-                    )
-                }
-            },
-        )
+    @Throws(IrohException::class)override fun `blobsReadAtToBytes`(`hash`: Hash, `offset`: kotlin.ULong, `len`: kotlin.ULong?): kotlin.ByteArray {
+            return FfiConverterByteArray.lift(
+    callWithPointer {
+    uniffiRustCallWithError(IrohException) { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_irohnode_blobs_read_at_to_bytes(
+        it, FfiConverterTypeHash.lower(`hash`),FfiConverterULong.lower(`offset`),FfiConverterOptionalULong.lower(`len`),_status)
+}
+    }
+    )
+    }
+    
 
+    
     /**
      * Read all bytes of single blob.
      *
@@ -11091,139 +10434,112 @@ open class IrohNode :
      * reading is small. If not sure, use [`Self::blobs_size`] and check the size with
      * before calling [`Self::blobs_read_to_bytes`].
      */
-    @Throws(
-        IrohException::class,
-        )
-    override fun `blobsReadToBytes`(`hash`: Hash): kotlin.ByteArray =
-        FfiConverterByteArray.lift(
-            callWithPointer {
-                uniffiRustCallWithError(IrohException) { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_irohnode_blobs_read_to_bytes(
-                        it,
-                        FfiConverterTypeHash.lower(`hash`),
-                        _status,
-                    )
-                }
-            },
-        )
+    @Throws(IrohException::class)override fun `blobsReadToBytes`(`hash`: Hash): kotlin.ByteArray {
+            return FfiConverterByteArray.lift(
+    callWithPointer {
+    uniffiRustCallWithError(IrohException) { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_irohnode_blobs_read_to_bytes(
+        it, FfiConverterTypeHash.lower(`hash`),_status)
+}
+    }
+    )
+    }
+    
 
+    
     /**
      * Create a ticket for sharing a blob or collection from this node.
      */
-    @Throws(
-        IrohException::class,
-        )
-    override fun `blobsShare`(
-        `hash`: Hash,
-        `blobFormat`: BlobFormat,
-        `ticketOptions`: AddrInfoOptions,
-    ): kotlin.String =
-        FfiConverterString.lift(
-            callWithPointer {
-                uniffiRustCallWithError(IrohException) { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_irohnode_blobs_share(
-                        it,
-                        FfiConverterTypeHash.lower(`hash`),
-                        FfiConverterTypeBlobFormat.lower(`blobFormat`),
-                        FfiConverterTypeAddrInfoOptions.lower(`ticketOptions`),
-                        _status,
-                    )
-                }
-            },
-        )
+    @Throws(IrohException::class)override fun `blobsShare`(`hash`: Hash, `blobFormat`: BlobFormat, `ticketOptions`: AddrInfoOptions): kotlin.String {
+            return FfiConverterString.lift(
+    callWithPointer {
+    uniffiRustCallWithError(IrohException) { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_irohnode_blobs_share(
+        it, FfiConverterTypeHash.lower(`hash`),FfiConverterTypeBlobFormat.lower(`blobFormat`),FfiConverterTypeAddrInfoOptions.lower(`ticketOptions`),_status)
+}
+    }
+    )
+    }
+    
 
+    
     /**
      * Get the size information on a single blob.
      */
-    @Throws(
-        IrohException::class,
-        )
-    override fun `blobsSize`(`hash`: Hash): kotlin.ULong =
-        FfiConverterULong.lift(
-            callWithPointer {
-                uniffiRustCallWithError(IrohException) { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_irohnode_blobs_size(
-                        it,
-                        FfiConverterTypeHash.lower(`hash`),
-                        _status,
-                    )
-                }
-            },
-        )
+    @Throws(IrohException::class)override fun `blobsSize`(`hash`: Hash): kotlin.ULong {
+            return FfiConverterULong.lift(
+    callWithPointer {
+    uniffiRustCallWithError(IrohException) { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_irohnode_blobs_size(
+        it, FfiConverterTypeHash.lower(`hash`),_status)
+}
+    }
+    )
+    }
+    
 
+    
     /**
      * Export the blob contents to a file path
      * The `path` field is expected to be the absolute path.
      */
-    @Throws(
-        IrohException::class,
-        )
-    override fun `blobsWriteToPath`(
-        `hash`: Hash,
-        `path`: kotlin.String,
-    ) = callWithPointer {
-        uniffiRustCallWithError(IrohException) { _status ->
-            UniffiLib.INSTANCE.uniffi_iroh_fn_method_irohnode_blobs_write_to_path(
-                it,
-                FfiConverterTypeHash.lower(`hash`),
-                FfiConverterString.lower(`path`),
-                _status,
-            )
-        }
+    @Throws(IrohException::class)override fun `blobsWriteToPath`(`hash`: Hash, `path`: kotlin.String)
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(IrohException) { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_irohnode_blobs_write_to_path(
+        it, FfiConverterTypeHash.lower(`hash`),FfiConverterString.lower(`path`),_status)
+}
     }
+    
+    
 
-    @Throws(
-        IrohException::class,
-        )
-    override fun `connectionInfo`(`nodeId`: PublicKey): ConnectionInfo? =
-        FfiConverterOptionalTypeConnectionInfo.lift(
-            callWithPointer {
-                uniffiRustCallWithError(IrohException) { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_irohnode_connection_info(
-                        it,
-                        FfiConverterTypePublicKey.lower(`nodeId`),
-                        _status,
-                    )
-                }
-            },
-        )
+    
+    @Throws(IrohException::class)override fun `connectionInfo`(`nodeId`: PublicKey): ConnectionInfo? {
+            return FfiConverterOptionalTypeConnectionInfo.lift(
+    callWithPointer {
+    uniffiRustCallWithError(IrohException) { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_irohnode_connection_info(
+        it, FfiConverterTypePublicKey.lower(`nodeId`),_status)
+}
+    }
+    )
+    }
+    
 
+    
     /**
      * Return `ConnectionInfo`s for each connection we have to another iroh node.
      */
-    @Throws(
-        IrohException::class,
-        )
-    override fun `connections`(): List<ConnectionInfo> =
-        FfiConverterSequenceTypeConnectionInfo.lift(
-            callWithPointer {
-                uniffiRustCallWithError(IrohException) { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_irohnode_connections(
-                        it,
-                        _status,
-                    )
-                }
-            },
-        )
+    @Throws(IrohException::class)override fun `connections`(): List<ConnectionInfo> {
+            return FfiConverterSequenceTypeConnectionInfo.lift(
+    callWithPointer {
+    uniffiRustCallWithError(IrohException) { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_irohnode_connections(
+        it, _status)
+}
+    }
+    )
+    }
+    
 
+    
     /**
      * Create a new doc.
      */
-    @Throws(
-        IrohException::class,
-        )
-    override fun `docCreate`(): Doc =
-        FfiConverterTypeDoc.lift(
-            callWithPointer {
-                uniffiRustCallWithError(IrohException) { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_irohnode_doc_create(
-                        it,
-                        _status,
-                    )
-                }
-            },
-        )
+    @Throws(IrohException::class)override fun `docCreate`(): Doc {
+            return FfiConverterTypeDoc.lift(
+    callWithPointer {
+    uniffiRustCallWithError(IrohException) { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_irohnode_doc_create(
+        it, _status)
+}
+    }
+    )
+    }
+    
 
+    
     /**
      * Delete a document from the local node.
      *
@@ -11231,215 +10547,201 @@ open class IrohNode :
      * document will be permanently deleted from the node's storage. Content blobs will be
      * deleted through garbage collection unless they are referenced from another document or tag.
      */
-    @Throws(
-        IrohException::class,
-        )
-    override fun `docDrop`(`docId`: kotlin.String) =
-        callWithPointer {
-            uniffiRustCallWithError(IrohException) { _status ->
-                UniffiLib.INSTANCE.uniffi_iroh_fn_method_irohnode_doc_drop(
-                    it,
-                    FfiConverterString.lower(`docId`),
-                    _status,
-                )
-            }
-        }
+    @Throws(IrohException::class)override fun `docDrop`(`docId`: kotlin.String)
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(IrohException) { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_irohnode_doc_drop(
+        it, FfiConverterString.lower(`docId`),_status)
+}
+    }
+    
+    
 
+    
     /**
      * Join and sync with an already existing document.
      */
-    @Throws(
-        IrohException::class,
-        )
-    override fun `docJoin`(`ticket`: kotlin.String): Doc =
-        FfiConverterTypeDoc.lift(
-            callWithPointer {
-                uniffiRustCallWithError(IrohException) { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_irohnode_doc_join(
-                        it,
-                        FfiConverterString.lower(`ticket`),
-                        _status,
-                    )
-                }
-            },
-        )
+    @Throws(IrohException::class)override fun `docJoin`(`ticket`: kotlin.String): Doc {
+            return FfiConverterTypeDoc.lift(
+    callWithPointer {
+    uniffiRustCallWithError(IrohException) { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_irohnode_doc_join(
+        it, FfiConverterString.lower(`ticket`),_status)
+}
+    }
+    )
+    }
+    
 
+    
     /**
      * Join and sync with an already existing document and subscribe to events on that document.
      */
-    @Throws(
-        IrohException::class,
-        )
-    override fun `docJoinAndSubscribe`(
-        `ticket`: kotlin.String,
-        `cb`: SubscribeCallback,
-    ): Doc =
-        FfiConverterTypeDoc.lift(
-            callWithPointer {
-                uniffiRustCallWithError(IrohException) { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_irohnode_doc_join_and_subscribe(
-                        it,
-                        FfiConverterString.lower(`ticket`),
-                        FfiConverterTypeSubscribeCallback.lower(`cb`),
-                        _status,
-                    )
-                }
-            },
-        )
+    @Throws(IrohException::class)override fun `docJoinAndSubscribe`(`ticket`: kotlin.String, `cb`: SubscribeCallback): Doc {
+            return FfiConverterTypeDoc.lift(
+    callWithPointer {
+    uniffiRustCallWithError(IrohException) { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_irohnode_doc_join_and_subscribe(
+        it, FfiConverterString.lower(`ticket`),FfiConverterTypeSubscribeCallback.lower(`cb`),_status)
+}
+    }
+    )
+    }
+    
 
+    
     /**
      * List all the docs we have access to on this node.
      */
-    @Throws(
-        IrohException::class,
-        )
-    override fun `docList`(): List<NamespaceAndCapability> =
-        FfiConverterSequenceTypeNamespaceAndCapability.lift(
-            callWithPointer {
-                uniffiRustCallWithError(IrohException) { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_irohnode_doc_list(
-                        it,
-                        _status,
-                    )
-                }
-            },
-        )
+    @Throws(IrohException::class)override fun `docList`(): List<NamespaceAndCapability> {
+            return FfiConverterSequenceTypeNamespaceAndCapability.lift(
+    callWithPointer {
+    uniffiRustCallWithError(IrohException) { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_irohnode_doc_list(
+        it, _status)
+}
+    }
+    )
+    }
+    
 
+    
     /**
      * Get a [`Doc`].
      *
      * Returns None if the document cannot be found.
      */
-    @Throws(
-        IrohException::class,
-        )
-    override fun `docOpen`(`id`: kotlin.String): Doc? =
-        FfiConverterOptionalTypeDoc.lift(
-            callWithPointer {
-                uniffiRustCallWithError(IrohException) { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_irohnode_doc_open(
-                        it,
-                        FfiConverterString.lower(`id`),
-                        _status,
-                    )
-                }
-            },
-        )
+    @Throws(IrohException::class)override fun `docOpen`(`id`: kotlin.String): Doc? {
+            return FfiConverterOptionalTypeDoc.lift(
+    callWithPointer {
+    uniffiRustCallWithError(IrohException) { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_irohnode_doc_open(
+        it, FfiConverterString.lower(`id`),_status)
+}
+    }
+    )
+    }
+    
 
+    
     /**
      * The string representation of the PublicKey of this node.
-     */
-    override fun `nodeId`(): kotlin.String =
-        FfiConverterString.lift(
-            callWithPointer {
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_irohnode_node_id(
-                        it,
-                        _status,
-                    )
-                }
-            },
-        )
+     */override fun `nodeId`(): kotlin.String {
+            return FfiConverterString.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_irohnode_node_id(
+        it, _status)
+}
+    }
+    )
+    }
+    
 
+    
     /**
      * Get statistics of the running node.
      */
-    @Throws(
-        IrohException::class,
-        )
-    override fun `stats`(): Map<kotlin.String, CounterStats> =
-        FfiConverterMapStringTypeCounterStats.lift(
-            callWithPointer {
-                uniffiRustCallWithError(IrohException) { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_irohnode_stats(
-                        it,
-                        _status,
-                    )
-                }
-            },
-        )
+    @Throws(IrohException::class)override fun `stats`(): Map<kotlin.String, CounterStats> {
+            return FfiConverterMapStringTypeCounterStats.lift(
+    callWithPointer {
+    uniffiRustCallWithError(IrohException) { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_irohnode_stats(
+        it, _status)
+}
+    }
+    )
+    }
+    
 
+    
     /**
      * Get status information about a node
      */
-    @Throws(
-        IrohException::class,
-        )
-    override fun `status`(): NodeStatus =
-        FfiConverterTypeNodeStatus.lift(
-            callWithPointer {
-                uniffiRustCallWithError(IrohException) { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_irohnode_status(
-                        it,
-                        _status,
-                    )
-                }
-            },
-        )
+    @Throws(IrohException::class)override fun `status`(): NodeStatus {
+            return FfiConverterTypeNodeStatus.lift(
+    callWithPointer {
+    uniffiRustCallWithError(IrohException) { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_irohnode_status(
+        it, _status)
+}
+    }
+    )
+    }
+    
 
+    
     /**
      * Delete a tag.
      */
-    @Throws(
-        IrohException::class,
-        )
-    override fun `tagsDelete`(`name`: kotlin.ByteArray) =
-        callWithPointer {
-            uniffiRustCallWithError(IrohException) { _status ->
-                UniffiLib.INSTANCE.uniffi_iroh_fn_method_irohnode_tags_delete(
-                    it,
-                    FfiConverterByteArray.lower(`name`),
-                    _status,
-                )
-            }
-        }
+    @Throws(IrohException::class)override fun `tagsDelete`(`name`: kotlin.ByteArray)
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(IrohException) { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_irohnode_tags_delete(
+        it, FfiConverterByteArray.lower(`name`),_status)
+}
+    }
+    
+    
 
+    
     /**
      * List all tags
      *
      * Note: this allocates for each `TagInfo`, if you have many `Tags`s this may be a prohibitively large list.
      * Please file an [issue](https://github.com/n0-computer/iroh-ffi/issues/new) if you run into this issue
      */
-    @Throws(
-        IrohException::class,
-        )
-    override fun `tagsList`(): List<TagInfo> =
-        FfiConverterSequenceTypeTagInfo.lift(
-            callWithPointer {
-                uniffiRustCallWithError(IrohException) { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_irohnode_tags_list(
-                        it,
-                        _status,
-                    )
-                }
-            },
-        )
-
-    companion object {
-        /**
-         * Create a new iroh node with options.
-         */
-        @Throws(IrohException::class)
-        fun `withOptions`(
-            `path`: kotlin.String,
-            `opts`: NodeOptions,
-        ): IrohNode =
-            FfiConverterTypeIrohNode.lift(
-                uniffiRustCallWithError(IrohException) { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_constructor_irohnode_with_options(
-                        FfiConverterString.lower(`path`),
-                        FfiConverterTypeNodeOptions.lower(`opts`),
-                        _status,
-                    )
-                },
-            )
+    @Throws(IrohException::class)override fun `tagsList`(): List<TagInfo> {
+            return FfiConverterSequenceTypeTagInfo.lift(
+    callWithPointer {
+    uniffiRustCallWithError(IrohException) { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_irohnode_tags_list(
+        it, _status)
+}
     }
+    )
+    }
+    
+
+    
+
+    
+    companion object {
+        
+    /**
+     * Create a new iroh node with options.
+     */
+    @Throws(IrohException::class)
+    @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
+     suspend fun `withOptions`(`path`: kotlin.String, `opts`: NodeOptions) : IrohNode {
+        return uniffiRustCallAsync(
+        UniffiLib.INSTANCE.uniffi_iroh_fn_constructor_irohnode_with_options(FfiConverterString.lower(`path`),FfiConverterTypeNodeOptions.lower(`opts`),),
+        { future, callback, continuation -> UniffiLib.INSTANCE.ffi_iroh_rust_future_poll_pointer(future, callback, continuation) },
+        { future, continuation -> UniffiLib.INSTANCE.ffi_iroh_rust_future_complete_pointer(future, continuation) },
+        { future -> UniffiLib.INSTANCE.ffi_iroh_rust_future_free_pointer(future) },
+        // lift function
+        { FfiConverterTypeIrohNode.lift(it) },
+        // Error FFI converter
+        IrohException.ErrorHandler,
+    )
+    }
+
+        
+    }
+    
 }
 
-public object FfiConverterTypeIrohNode : FfiConverter<IrohNode, Pointer> {
-    override fun lower(value: IrohNode): Pointer = value.uniffiClonePointer()
+public object FfiConverterTypeIrohNode: FfiConverter<IrohNode, Pointer> {
 
-    override fun lift(value: Pointer): IrohNode = IrohNode(value)
+    override fun lower(value: IrohNode): Pointer {
+        return value.uniffiClonePointer()
+    }
+
+    override fun lift(value: Pointer): IrohNode {
+        return IrohNode(value)
+    }
 
     override fun read(buf: ByteBuffer): IrohNode {
         // The Rust code always writes pointers as 8 bytes, and will
@@ -11449,15 +10751,13 @@ public object FfiConverterTypeIrohNode : FfiConverter<IrohNode, Pointer> {
 
     override fun allocationSize(value: IrohNode) = 8UL
 
-    override fun write(
-        value: IrohNode,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: IrohNode, buf: ByteBuffer) {
         // The Rust code always expects pointers written as 8 bytes,
         // and will fail to compile if they don't fit.
         buf.putLong(Pointer.nativeValue(lower(value)))
     }
 }
+
 
 // This template implements a class for working with a Rust struct via a Pointer/Arc<T>
 // to the live Rust struct on the other side of the FFI.
@@ -11556,55 +10856,55 @@ public object FfiConverterTypeIrohNode : FfiConverter<IrohNode, Pointer> {
 // [1] https://stackoverflow.com/questions/24376768/can-java-finalize-an-object-when-it-is-still-in-scope/24380219
 //
 
+
 /**
  * Events informing about actions of the live sync progress
  */
 public interface LiveEventInterface {
+    
     /**
      * For `LiveEventType::ContentReady`, returns a Hash
      */
     fun `asContentReady`(): Hash
-
+    
     /**
      * For `LiveEventType::InsertLocal`, returns an Entry
      */
     fun `asInsertLocal`(): Entry
-
+    
     /**
      * For `LiveEventType::InsertRemote`, returns an InsertRemoteEvent
      */
     fun `asInsertRemote`(): InsertRemoteEvent
-
+    
     /**
      * For `LiveEventType::NeighborDown`, returns a PublicKey
      */
     fun `asNeighborDown`(): PublicKey
-
+    
     /**
      * For `LiveEventType::NeighborUp`, returns a PublicKey
      */
     fun `asNeighborUp`(): PublicKey
-
+    
     /**
      * For `LiveEventType::SyncFinished`, returns a SyncEvent
      */
     fun `asSyncFinished`(): SyncEvent
-
+    
     /**
      * The type LiveEvent
      */
     fun `type`(): LiveEventType
-
+    
     companion object
 }
 
 /**
  * Events informing about actions of the live sync progress
  */
-open class LiveEvent :
-    Disposable,
-    AutoCloseable,
-    LiveEventInterface {
+open class LiveEvent: Disposable, AutoCloseable, LiveEventInterface {
+
     constructor(pointer: Pointer) {
         this.pointer = pointer
         this.cleanable = UniffiLib.CLEANER.register(this, UniffiCleanAction(pointer))
@@ -11654,7 +10954,7 @@ open class LiveEvent :
             if (c == Long.MAX_VALUE) {
                 throw IllegalStateException("${this.javaClass.simpleName} call counter would overflow")
             }
-        } while (!this.callCounter.compareAndSet(c, c + 1L))
+        } while (! this.callCounter.compareAndSet(c, c + 1L))
         // Now we can safely do the method call without the pointer being freed concurrently.
         try {
             return block(this.uniffiClonePointer())
@@ -11668,9 +10968,7 @@ open class LiveEvent :
 
     // Use a static inner class instead of a closure so as not to accidentally
     // capture `this` as part of the cleanable's action.
-    private class UniffiCleanAction(
-        private val pointer: Pointer?,
-    ) : Runnable {
+    private class UniffiCleanAction(private val pointer: Pointer?) : Runnable {
         override fun run() {
             pointer?.let { ptr ->
                 uniffiRustCall { status ->
@@ -11680,123 +10978,134 @@ open class LiveEvent :
         }
     }
 
-    fun uniffiClonePointer(): Pointer =
-        uniffiRustCall { status ->
+    fun uniffiClonePointer(): Pointer {
+        return uniffiRustCall() { status ->
             UniffiLib.INSTANCE.uniffi_iroh_fn_clone_liveevent(pointer!!, status)
         }
+    }
 
+    
     /**
      * For `LiveEventType::ContentReady`, returns a Hash
-     */
-    override fun `asContentReady`(): Hash =
-        FfiConverterTypeHash.lift(
-            callWithPointer {
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_liveevent_as_content_ready(
-                        it,
-                        _status,
-                    )
-                }
-            },
-        )
+     */override fun `asContentReady`(): Hash {
+            return FfiConverterTypeHash.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_liveevent_as_content_ready(
+        it, _status)
+}
+    }
+    )
+    }
+    
 
+    
     /**
      * For `LiveEventType::InsertLocal`, returns an Entry
-     */
-    override fun `asInsertLocal`(): Entry =
-        FfiConverterTypeEntry.lift(
-            callWithPointer {
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_liveevent_as_insert_local(
-                        it,
-                        _status,
-                    )
-                }
-            },
-        )
+     */override fun `asInsertLocal`(): Entry {
+            return FfiConverterTypeEntry.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_liveevent_as_insert_local(
+        it, _status)
+}
+    }
+    )
+    }
+    
 
+    
     /**
      * For `LiveEventType::InsertRemote`, returns an InsertRemoteEvent
-     */
-    override fun `asInsertRemote`(): InsertRemoteEvent =
-        FfiConverterTypeInsertRemoteEvent.lift(
-            callWithPointer {
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_liveevent_as_insert_remote(
-                        it,
-                        _status,
-                    )
-                }
-            },
-        )
+     */override fun `asInsertRemote`(): InsertRemoteEvent {
+            return FfiConverterTypeInsertRemoteEvent.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_liveevent_as_insert_remote(
+        it, _status)
+}
+    }
+    )
+    }
+    
 
+    
     /**
      * For `LiveEventType::NeighborDown`, returns a PublicKey
-     */
-    override fun `asNeighborDown`(): PublicKey =
-        FfiConverterTypePublicKey.lift(
-            callWithPointer {
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_liveevent_as_neighbor_down(
-                        it,
-                        _status,
-                    )
-                }
-            },
-        )
+     */override fun `asNeighborDown`(): PublicKey {
+            return FfiConverterTypePublicKey.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_liveevent_as_neighbor_down(
+        it, _status)
+}
+    }
+    )
+    }
+    
 
+    
     /**
      * For `LiveEventType::NeighborUp`, returns a PublicKey
-     */
-    override fun `asNeighborUp`(): PublicKey =
-        FfiConverterTypePublicKey.lift(
-            callWithPointer {
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_liveevent_as_neighbor_up(
-                        it,
-                        _status,
-                    )
-                }
-            },
-        )
+     */override fun `asNeighborUp`(): PublicKey {
+            return FfiConverterTypePublicKey.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_liveevent_as_neighbor_up(
+        it, _status)
+}
+    }
+    )
+    }
+    
 
+    
     /**
      * For `LiveEventType::SyncFinished`, returns a SyncEvent
-     */
-    override fun `asSyncFinished`(): SyncEvent =
-        FfiConverterTypeSyncEvent.lift(
-            callWithPointer {
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_liveevent_as_sync_finished(
-                        it,
-                        _status,
-                    )
-                }
-            },
-        )
+     */override fun `asSyncFinished`(): SyncEvent {
+            return FfiConverterTypeSyncEvent.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_liveevent_as_sync_finished(
+        it, _status)
+}
+    }
+    )
+    }
+    
 
+    
     /**
      * The type LiveEvent
-     */
-    override fun `type`(): LiveEventType =
-        FfiConverterTypeLiveEventType.lift(
-            callWithPointer {
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_liveevent_type(
-                        it,
-                        _status,
-                    )
-                }
-            },
-        )
+     */override fun `type`(): LiveEventType {
+            return FfiConverterTypeLiveEventType.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_liveevent_type(
+        it, _status)
+}
+    }
+    )
+    }
+    
 
+    
+
+    
+    
     companion object
+    
 }
 
-public object FfiConverterTypeLiveEvent : FfiConverter<LiveEvent, Pointer> {
-    override fun lower(value: LiveEvent): Pointer = value.uniffiClonePointer()
+public object FfiConverterTypeLiveEvent: FfiConverter<LiveEvent, Pointer> {
 
-    override fun lift(value: Pointer): LiveEvent = LiveEvent(value)
+    override fun lower(value: LiveEvent): Pointer {
+        return value.uniffiClonePointer()
+    }
+
+    override fun lift(value: Pointer): LiveEvent {
+        return LiveEvent(value)
+    }
 
     override fun read(buf: ByteBuffer): LiveEvent {
         // The Rust code always writes pointers as 8 bytes, and will
@@ -11806,15 +11115,13 @@ public object FfiConverterTypeLiveEvent : FfiConverter<LiveEvent, Pointer> {
 
     override fun allocationSize(value: LiveEvent) = 8UL
 
-    override fun write(
-        value: LiveEvent,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: LiveEvent, buf: ByteBuffer) {
         // The Rust code always expects pointers written as 8 bytes,
         // and will fail to compile if they don't fit.
         buf.putLong(Pointer.nativeValue(lower(value)))
     }
 }
+
 
 // This template implements a class for working with a Rust struct via a Pointer/Arc<T>
 // to the live Rust struct on the other side of the FFI.
@@ -11913,35 +11220,35 @@ public object FfiConverterTypeLiveEvent : FfiConverter<LiveEvent, Pointer> {
 // [1] https://stackoverflow.com/questions/24376768/can-java-finalize-an-object-when-it-is-still-in-scope/24380219
 //
 
+
 /**
  * A peer and it's addressing information.
  */
 public interface NodeAddrInterface {
+    
     /**
      * Get the direct addresses of this peer.
      */
     fun `directAddresses`(): List<kotlin.String>
-
+    
     /**
      * Returns true if both NodeAddr's have the same values
      */
     fun `equal`(`other`: NodeAddr): kotlin.Boolean
-
+    
     /**
      * Get the relay url of this peer.
      */
     fun `relayUrl`(): kotlin.String?
-
+    
     companion object
 }
 
 /**
  * A peer and it's addressing information.
  */
-open class NodeAddr :
-    Disposable,
-    AutoCloseable,
-    NodeAddrInterface {
+open class NodeAddr: Disposable, AutoCloseable, NodeAddrInterface {
+
     constructor(pointer: Pointer) {
         this.pointer = pointer
         this.cleanable = UniffiLib.CLEANER.register(this, UniffiCleanAction(pointer))
@@ -11957,21 +11264,16 @@ open class NodeAddr :
         this.pointer = null
         this.cleanable = UniffiLib.CLEANER.register(this, UniffiCleanAction(pointer))
     }
-
     /**
      * Create a new [`NodeAddr`] with empty [`AddrInfo`].
      */
     constructor(`nodeId`: PublicKey, `relayUrl`: kotlin.String?, `addresses`: List<kotlin.String>) :
         this(
-            uniffiRustCall { _status ->
-                UniffiLib.INSTANCE.uniffi_iroh_fn_constructor_nodeaddr_new(
-                    FfiConverterTypePublicKey.lower(`nodeId`),
-                    FfiConverterOptionalString.lower(`relayUrl`),
-                    FfiConverterSequenceString.lower(`addresses`),
-                    _status,
-                )
-            },
-        )
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_constructor_nodeaddr_new(
+        FfiConverterTypePublicKey.lower(`nodeId`),FfiConverterOptionalString.lower(`relayUrl`),FfiConverterSequenceString.lower(`addresses`),_status)
+}
+    )
 
     protected val pointer: Pointer?
     protected val cleanable: UniffiCleaner.Cleanable
@@ -12006,7 +11308,7 @@ open class NodeAddr :
             if (c == Long.MAX_VALUE) {
                 throw IllegalStateException("${this.javaClass.simpleName} call counter would overflow")
             }
-        } while (!this.callCounter.compareAndSet(c, c + 1L))
+        } while (! this.callCounter.compareAndSet(c, c + 1L))
         // Now we can safely do the method call without the pointer being freed concurrently.
         try {
             return block(this.uniffiClonePointer())
@@ -12020,9 +11322,7 @@ open class NodeAddr :
 
     // Use a static inner class instead of a closure so as not to accidentally
     // capture `this` as part of the cleanable's action.
-    private class UniffiCleanAction(
-        private val pointer: Pointer?,
-    ) : Runnable {
+    private class UniffiCleanAction(private val pointer: Pointer?) : Runnable {
         override fun run() {
             pointer?.let { ptr ->
                 uniffiRustCall { status ->
@@ -12032,64 +11332,74 @@ open class NodeAddr :
         }
     }
 
-    fun uniffiClonePointer(): Pointer =
-        uniffiRustCall { status ->
+    fun uniffiClonePointer(): Pointer {
+        return uniffiRustCall() { status ->
             UniffiLib.INSTANCE.uniffi_iroh_fn_clone_nodeaddr(pointer!!, status)
         }
+    }
 
+    
     /**
      * Get the direct addresses of this peer.
-     */
-    override fun `directAddresses`(): List<kotlin.String> =
-        FfiConverterSequenceString.lift(
-            callWithPointer {
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_nodeaddr_direct_addresses(
-                        it,
-                        _status,
-                    )
-                }
-            },
-        )
+     */override fun `directAddresses`(): List<kotlin.String> {
+            return FfiConverterSequenceString.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_nodeaddr_direct_addresses(
+        it, _status)
+}
+    }
+    )
+    }
+    
 
+    
     /**
      * Returns true if both NodeAddr's have the same values
-     */
-    override fun `equal`(`other`: NodeAddr): kotlin.Boolean =
-        FfiConverterBoolean.lift(
-            callWithPointer {
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_nodeaddr_equal(
-                        it,
-                        FfiConverterTypeNodeAddr.lower(`other`),
-                        _status,
-                    )
-                }
-            },
-        )
+     */override fun `equal`(`other`: NodeAddr): kotlin.Boolean {
+            return FfiConverterBoolean.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_nodeaddr_equal(
+        it, FfiConverterTypeNodeAddr.lower(`other`),_status)
+}
+    }
+    )
+    }
+    
 
+    
     /**
      * Get the relay url of this peer.
-     */
-    override fun `relayUrl`(): kotlin.String? =
-        FfiConverterOptionalString.lift(
-            callWithPointer {
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_nodeaddr_relay_url(
-                        it,
-                        _status,
-                    )
-                }
-            },
-        )
+     */override fun `relayUrl`(): kotlin.String? {
+            return FfiConverterOptionalString.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_nodeaddr_relay_url(
+        it, _status)
+}
+    }
+    )
+    }
+    
 
+    
+
+    
+    
     companion object
+    
 }
 
-public object FfiConverterTypeNodeAddr : FfiConverter<NodeAddr, Pointer> {
-    override fun lower(value: NodeAddr): Pointer = value.uniffiClonePointer()
+public object FfiConverterTypeNodeAddr: FfiConverter<NodeAddr, Pointer> {
 
-    override fun lift(value: Pointer): NodeAddr = NodeAddr(value)
+    override fun lower(value: NodeAddr): Pointer {
+        return value.uniffiClonePointer()
+    }
+
+    override fun lift(value: Pointer): NodeAddr {
+        return NodeAddr(value)
+    }
 
     override fun read(buf: ByteBuffer): NodeAddr {
         // The Rust code always writes pointers as 8 bytes, and will
@@ -12099,15 +11409,13 @@ public object FfiConverterTypeNodeAddr : FfiConverter<NodeAddr, Pointer> {
 
     override fun allocationSize(value: NodeAddr) = 8UL
 
-    override fun write(
-        value: NodeAddr,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: NodeAddr, buf: ByteBuffer) {
         // The Rust code always expects pointers written as 8 bytes,
         // and will fail to compile if they don't fit.
         buf.putLong(Pointer.nativeValue(lower(value)))
     }
 }
+
 
 // This template implements a class for working with a Rust struct via a Pointer/Arc<T>
 // to the live Rust struct on the other side of the FFI.
@@ -12206,29 +11514,29 @@ public object FfiConverterTypeNodeAddr : FfiConverter<NodeAddr, Pointer> {
 // [1] https://stackoverflow.com/questions/24376768/can-java-finalize-an-object-when-it-is-still-in-scope/24380219
 //
 
+
 public interface NodeStatusInterface {
+    
     /**
      * The bound listening addresses of the node
      */
     fun `listenAddrs`(): List<kotlin.String>
-
+    
     /**
      * The node id and socket addresses of this node.
      */
     fun `nodeAddr`(): NodeAddr
-
+    
     /**
      * The version of the node
      */
     fun `version`(): kotlin.String
-
+    
     companion object
 }
 
-open class NodeStatus :
-    Disposable,
-    AutoCloseable,
-    NodeStatusInterface {
+open class NodeStatus: Disposable, AutoCloseable, NodeStatusInterface {
+
     constructor(pointer: Pointer) {
         this.pointer = pointer
         this.cleanable = UniffiLib.CLEANER.register(this, UniffiCleanAction(pointer))
@@ -12278,7 +11586,7 @@ open class NodeStatus :
             if (c == Long.MAX_VALUE) {
                 throw IllegalStateException("${this.javaClass.simpleName} call counter would overflow")
             }
-        } while (!this.callCounter.compareAndSet(c, c + 1L))
+        } while (! this.callCounter.compareAndSet(c, c + 1L))
         // Now we can safely do the method call without the pointer being freed concurrently.
         try {
             return block(this.uniffiClonePointer())
@@ -12292,9 +11600,7 @@ open class NodeStatus :
 
     // Use a static inner class instead of a closure so as not to accidentally
     // capture `this` as part of the cleanable's action.
-    private class UniffiCleanAction(
-        private val pointer: Pointer?,
-    ) : Runnable {
+    private class UniffiCleanAction(private val pointer: Pointer?) : Runnable {
         override fun run() {
             pointer?.let { ptr ->
                 uniffiRustCall { status ->
@@ -12304,63 +11610,74 @@ open class NodeStatus :
         }
     }
 
-    fun uniffiClonePointer(): Pointer =
-        uniffiRustCall { status ->
+    fun uniffiClonePointer(): Pointer {
+        return uniffiRustCall() { status ->
             UniffiLib.INSTANCE.uniffi_iroh_fn_clone_nodestatus(pointer!!, status)
         }
+    }
 
+    
     /**
      * The bound listening addresses of the node
-     */
-    override fun `listenAddrs`(): List<kotlin.String> =
-        FfiConverterSequenceString.lift(
-            callWithPointer {
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_nodestatus_listen_addrs(
-                        it,
-                        _status,
-                    )
-                }
-            },
-        )
+     */override fun `listenAddrs`(): List<kotlin.String> {
+            return FfiConverterSequenceString.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_nodestatus_listen_addrs(
+        it, _status)
+}
+    }
+    )
+    }
+    
 
+    
     /**
      * The node id and socket addresses of this node.
-     */
-    override fun `nodeAddr`(): NodeAddr =
-        FfiConverterTypeNodeAddr.lift(
-            callWithPointer {
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_nodestatus_node_addr(
-                        it,
-                        _status,
-                    )
-                }
-            },
-        )
+     */override fun `nodeAddr`(): NodeAddr {
+            return FfiConverterTypeNodeAddr.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_nodestatus_node_addr(
+        it, _status)
+}
+    }
+    )
+    }
+    
 
+    
     /**
      * The version of the node
-     */
-    override fun `version`(): kotlin.String =
-        FfiConverterString.lift(
-            callWithPointer {
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_nodestatus_version(
-                        it,
-                        _status,
-                    )
-                }
-            },
-        )
+     */override fun `version`(): kotlin.String {
+            return FfiConverterString.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_nodestatus_version(
+        it, _status)
+}
+    }
+    )
+    }
+    
 
+    
+
+    
+    
     companion object
+    
 }
 
-public object FfiConverterTypeNodeStatus : FfiConverter<NodeStatus, Pointer> {
-    override fun lower(value: NodeStatus): Pointer = value.uniffiClonePointer()
+public object FfiConverterTypeNodeStatus: FfiConverter<NodeStatus, Pointer> {
 
-    override fun lift(value: Pointer): NodeStatus = NodeStatus(value)
+    override fun lower(value: NodeStatus): Pointer {
+        return value.uniffiClonePointer()
+    }
+
+    override fun lift(value: Pointer): NodeStatus {
+        return NodeStatus(value)
+    }
 
     override fun read(buf: ByteBuffer): NodeStatus {
         // The Rust code always writes pointers as 8 bytes, and will
@@ -12370,15 +11687,13 @@ public object FfiConverterTypeNodeStatus : FfiConverter<NodeStatus, Pointer> {
 
     override fun allocationSize(value: NodeStatus) = 8UL
 
-    override fun write(
-        value: NodeStatus,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: NodeStatus, buf: ByteBuffer) {
         // The Rust code always expects pointers written as 8 bytes,
         // and will fail to compile if they don't fit.
         buf.putLong(Pointer.nativeValue(lower(value)))
     }
 }
+
 
 // This template implements a class for working with a Rust struct via a Pointer/Arc<T>
 // to the live Rust struct on the other side of the FFI.
@@ -12477,35 +11792,35 @@ public object FfiConverterTypeNodeStatus : FfiConverter<NodeStatus, Pointer> {
 // [1] https://stackoverflow.com/questions/24376768/can-java-finalize-an-object-when-it-is-still-in-scope/24380219
 //
 
+
 /**
  * A public key
  */
 public interface PublicKeyInterface {
+    
     /**
      * Returns true when both PublicKeys have the same value
      */
     fun `equal`(`other`: PublicKey): kotlin.Boolean
-
+    
     /**
      * The first 10 bytes of the PublicKey represented as a string
      */
     fun `fmtShort`(): kotlin.String
-
+    
     /**
      * Represent a PublicKey as a byte slice
      */
     fun `toBytes`(): kotlin.ByteArray
-
+    
     companion object
 }
 
 /**
  * A public key
  */
-open class PublicKey :
-    Disposable,
-    AutoCloseable,
-    PublicKeyInterface {
+open class PublicKey: Disposable, AutoCloseable, PublicKeyInterface {
+
     constructor(pointer: Pointer) {
         this.pointer = pointer
         this.cleanable = UniffiLib.CLEANER.register(this, UniffiCleanAction(pointer))
@@ -12555,7 +11870,7 @@ open class PublicKey :
             if (c == Long.MAX_VALUE) {
                 throw IllegalStateException("${this.javaClass.simpleName} call counter would overflow")
             }
-        } while (!this.callCounter.compareAndSet(c, c + 1L))
+        } while (! this.callCounter.compareAndSet(c, c + 1L))
         // Now we can safely do the method call without the pointer being freed concurrently.
         try {
             return block(this.uniffiClonePointer())
@@ -12569,9 +11884,7 @@ open class PublicKey :
 
     // Use a static inner class instead of a closure so as not to accidentally
     // capture `this` as part of the cleanable's action.
-    private class UniffiCleanAction(
-        private val pointer: Pointer?,
-    ) : Runnable {
+    private class UniffiCleanAction(private val pointer: Pointer?) : Runnable {
         override fun run() {
             pointer?.let { ptr ->
                 uniffiRustCall { status ->
@@ -12581,104 +11894,114 @@ open class PublicKey :
         }
     }
 
-    fun uniffiClonePointer(): Pointer =
-        uniffiRustCall { status ->
+    fun uniffiClonePointer(): Pointer {
+        return uniffiRustCall() { status ->
             UniffiLib.INSTANCE.uniffi_iroh_fn_clone_publickey(pointer!!, status)
         }
+    }
 
+    
     /**
      * Returns true when both PublicKeys have the same value
-     */
-    override fun `equal`(`other`: PublicKey): kotlin.Boolean =
-        FfiConverterBoolean.lift(
-            callWithPointer {
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_publickey_equal(
-                        it,
-                        FfiConverterTypePublicKey.lower(`other`),
-                        _status,
-                    )
-                }
-            },
-        )
+     */override fun `equal`(`other`: PublicKey): kotlin.Boolean {
+            return FfiConverterBoolean.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_publickey_equal(
+        it, FfiConverterTypePublicKey.lower(`other`),_status)
+}
+    }
+    )
+    }
+    
 
+    
     /**
      * The first 10 bytes of the PublicKey represented as a string
-     */
-    override fun `fmtShort`(): kotlin.String =
-        FfiConverterString.lift(
-            callWithPointer {
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_publickey_fmt_short(
-                        it,
-                        _status,
-                    )
-                }
-            },
-        )
+     */override fun `fmtShort`(): kotlin.String {
+            return FfiConverterString.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_publickey_fmt_short(
+        it, _status)
+}
+    }
+    )
+    }
+    
 
+    
     /**
      * Represent a PublicKey as a byte slice
-     */
-    override fun `toBytes`(): kotlin.ByteArray =
-        FfiConverterByteArray.lift(
-            callWithPointer {
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_publickey_to_bytes(
-                        it,
-                        _status,
-                    )
-                }
-            },
-        )
-
-    override fun toString(): String =
-        FfiConverterString.lift(
-            callWithPointer {
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_publickey_uniffi_trait_display(
-                        it,
-                        _status,
-                    )
-                }
-            },
-        )
-
-    companion object {
-        /**
-         * Get a PublicKey from a byte slice
-         */
-        @Throws(IrohException::class)
-        fun `fromBytes`(`bytes`: kotlin.ByteArray): PublicKey =
-            FfiConverterTypePublicKey.lift(
-                uniffiRustCallWithError(IrohException) { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_constructor_publickey_from_bytes(
-                        FfiConverterByteArray.lower(`bytes`),
-                        _status,
-                    )
-                },
-            )
-
-        /**
-         * Get a PublicKey from a string
-         */
-        @Throws(IrohException::class)
-        fun `fromString`(`s`: kotlin.String): PublicKey =
-            FfiConverterTypePublicKey.lift(
-                uniffiRustCallWithError(IrohException) { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_constructor_publickey_from_string(
-                        FfiConverterString.lower(`s`),
-                        _status,
-                    )
-                },
-            )
+     */override fun `toBytes`(): kotlin.ByteArray {
+            return FfiConverterByteArray.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_publickey_to_bytes(
+        it, _status)
+}
     }
+    )
+    }
+    
+
+    
+    override fun toString(): String {
+        return FfiConverterString.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_publickey_uniffi_trait_display(
+        it, _status)
+}
+    }
+    )
+    }
+    
+
+    
+    companion object {
+        
+    /**
+     * Get a PublicKey from a byte slice
+     */
+    @Throws(IrohException::class) fun `fromBytes`(`bytes`: kotlin.ByteArray): PublicKey {
+            return FfiConverterTypePublicKey.lift(
+    uniffiRustCallWithError(IrohException) { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_constructor_publickey_from_bytes(
+        FfiConverterByteArray.lower(`bytes`),_status)
+}
+    )
+    }
+    
+
+        
+    /**
+     * Get a PublicKey from a string
+     */
+    @Throws(IrohException::class) fun `fromString`(`s`: kotlin.String): PublicKey {
+            return FfiConverterTypePublicKey.lift(
+    uniffiRustCallWithError(IrohException) { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_constructor_publickey_from_string(
+        FfiConverterString.lower(`s`),_status)
+}
+    )
+    }
+    
+
+        
+    }
+    
 }
 
-public object FfiConverterTypePublicKey : FfiConverter<PublicKey, Pointer> {
-    override fun lower(value: PublicKey): Pointer = value.uniffiClonePointer()
+public object FfiConverterTypePublicKey: FfiConverter<PublicKey, Pointer> {
 
-    override fun lift(value: Pointer): PublicKey = PublicKey(value)
+    override fun lower(value: PublicKey): Pointer {
+        return value.uniffiClonePointer()
+    }
+
+    override fun lift(value: Pointer): PublicKey {
+        return PublicKey(value)
+    }
 
     override fun read(buf: ByteBuffer): PublicKey {
         // The Rust code always writes pointers as 8 bytes, and will
@@ -12688,15 +12011,13 @@ public object FfiConverterTypePublicKey : FfiConverter<PublicKey, Pointer> {
 
     override fun allocationSize(value: PublicKey) = 8UL
 
-    override fun write(
-        value: PublicKey,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: PublicKey, buf: ByteBuffer) {
         // The Rust code always expects pointers written as 8 bytes,
         // and will fail to compile if they don't fit.
         buf.putLong(Pointer.nativeValue(lower(value)))
     }
 }
+
 
 // This template implements a class for working with a Rust struct via a Pointer/Arc<T>
 // to the live Rust struct on the other side of the FFI.
@@ -12795,22 +12116,24 @@ public object FfiConverterTypePublicKey : FfiConverter<PublicKey, Pointer> {
 // [1] https://stackoverflow.com/questions/24376768/can-java-finalize-an-object-when-it-is-still-in-scope/24380219
 //
 
+
 /**
  * Build a Query to search for an entry or entries in a doc.
  *
  * Use this with `QueryOptions` to determine sorting, grouping, and pagination.
  */
 public interface QueryInterface {
+    
     /**
      * Get the limit for this query (max. number of entries to emit).
      */
     fun `limit`(): kotlin.ULong?
-
+    
     /**
      * Get the offset for this query (number of entries to skip at the beginning).
      */
     fun `offset`(): kotlin.ULong
-
+    
     companion object
 }
 
@@ -12819,10 +12142,8 @@ public interface QueryInterface {
  *
  * Use this with `QueryOptions` to determine sorting, grouping, and pagination.
  */
-open class Query :
-    Disposable,
-    AutoCloseable,
-    QueryInterface {
+open class Query: Disposable, AutoCloseable, QueryInterface {
+
     constructor(pointer: Pointer) {
         this.pointer = pointer
         this.cleanable = UniffiLib.CLEANER.register(this, UniffiCleanAction(pointer))
@@ -12872,7 +12193,7 @@ open class Query :
             if (c == Long.MAX_VALUE) {
                 throw IllegalStateException("${this.javaClass.simpleName} call counter would overflow")
             }
-        } while (!this.callCounter.compareAndSet(c, c + 1L))
+        } while (! this.callCounter.compareAndSet(c, c + 1L))
         // Now we can safely do the method call without the pointer being freed concurrently.
         try {
             return block(this.uniffiClonePointer())
@@ -12886,9 +12207,7 @@ open class Query :
 
     // Use a static inner class instead of a closure so as not to accidentally
     // capture `this` as part of the cleanable's action.
-    private class UniffiCleanAction(
-        private val pointer: Pointer?,
-    ) : Runnable {
+    private class UniffiCleanAction(private val pointer: Pointer?) : Runnable {
         override fun run() {
             pointer?.let { ptr ->
                 uniffiRustCall { status ->
@@ -12898,233 +12217,219 @@ open class Query :
         }
     }
 
-    fun uniffiClonePointer(): Pointer =
-        uniffiRustCall { status ->
+    fun uniffiClonePointer(): Pointer {
+        return uniffiRustCall() { status ->
             UniffiLib.INSTANCE.uniffi_iroh_fn_clone_query(pointer!!, status)
         }
+    }
 
+    
     /**
      * Get the limit for this query (max. number of entries to emit).
-     */
-    override fun `limit`(): kotlin.ULong? =
-        FfiConverterOptionalULong.lift(
-            callWithPointer {
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_query_limit(
-                        it,
-                        _status,
-                    )
-                }
-            },
-        )
+     */override fun `limit`(): kotlin.ULong? {
+            return FfiConverterOptionalULong.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_query_limit(
+        it, _status)
+}
+    }
+    )
+    }
+    
 
+    
     /**
      * Get the offset for this query (number of entries to skip at the beginning).
-     */
-    override fun `offset`(): kotlin.ULong =
-        FfiConverterULong.lift(
-            callWithPointer {
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_query_offset(
-                        it,
-                        _status,
-                    )
-                }
-            },
-        )
-
-    companion object {
-        /**
-         * Query all records.
-         *
-         * If `opts` is `None`, the default values will be used:
-         *     sort_by: SortBy::AuthorKey
-         *     direction: SortDirection::Asc
-         *     offset: None
-         *     limit: None
-         */
-        fun `all`(`opts`: QueryOptions?): Query =
-            FfiConverterTypeQuery.lift(
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_constructor_query_all(
-                        FfiConverterOptionalTypeQueryOptions.lower(`opts`),
-                        _status,
-                    )
-                },
-            )
-
-        /**
-         * Query all entries for by a single author.
-         *
-         * If `opts` is `None`, the default values will be used:
-         *     sort_by: SortBy::AuthorKey
-         *     direction: SortDirection::Asc
-         *     offset: None
-         *     limit: None
-         */
-        fun `author`(
-            `author`: AuthorId,
-            `opts`: QueryOptions?,
-        ): Query =
-            FfiConverterTypeQuery.lift(
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_constructor_query_author(
-                        FfiConverterTypeAuthorId.lower(`author`),
-                        FfiConverterOptionalTypeQueryOptions.lower(`opts`),
-                        _status,
-                    )
-                },
-            )
-
-        /**
-         * Create a Query for a single key and author.
-         */
-        fun `authorKeyExact`(
-            `author`: AuthorId,
-            `key`: kotlin.ByteArray,
-        ): Query =
-            FfiConverterTypeQuery.lift(
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_constructor_query_author_key_exact(
-                        FfiConverterTypeAuthorId.lower(`author`),
-                        FfiConverterByteArray.lower(`key`),
-                        _status,
-                    )
-                },
-            )
-
-        /**
-         * Create a query for all entries of a single author with a given key prefix.
-         *
-         * If `opts` is `None`, the default values will be used:
-         *     direction: SortDirection::Asc
-         *     offset: None
-         *     limit: None
-         */
-        fun `authorKeyPrefix`(
-            `author`: AuthorId,
-            `prefix`: kotlin.ByteArray,
-            `opts`: QueryOptions?,
-        ): Query =
-            FfiConverterTypeQuery.lift(
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_constructor_query_author_key_prefix(
-                        FfiConverterTypeAuthorId.lower(`author`),
-                        FfiConverterByteArray.lower(`prefix`),
-                        FfiConverterOptionalTypeQueryOptions.lower(`opts`),
-                        _status,
-                    )
-                },
-            )
-
-        /**
-         * Query all entries that have an exact key.
-         *
-         * If `opts` is `None`, the default values will be used:
-         *     sort_by: SortBy::AuthorKey
-         *     direction: SortDirection::Asc
-         *     offset: None
-         *     limit: None
-         */
-        fun `keyExact`(
-            `key`: kotlin.ByteArray,
-            `opts`: QueryOptions?,
-        ): Query =
-            FfiConverterTypeQuery.lift(
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_constructor_query_key_exact(
-                        FfiConverterByteArray.lower(`key`),
-                        FfiConverterOptionalTypeQueryOptions.lower(`opts`),
-                        _status,
-                    )
-                },
-            )
-
-        /**
-         * Create a query for all entries with a given key prefix.
-         *
-         * If `opts` is `None`, the default values will be used:
-         *     sort_by: SortBy::AuthorKey
-         *     direction: SortDirection::Asc
-         *     offset: None
-         *     limit: None
-         */
-        fun `keyPrefix`(
-            `prefix`: kotlin.ByteArray,
-            `opts`: QueryOptions?,
-        ): Query =
-            FfiConverterTypeQuery.lift(
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_constructor_query_key_prefix(
-                        FfiConverterByteArray.lower(`prefix`),
-                        FfiConverterOptionalTypeQueryOptions.lower(`opts`),
-                        _status,
-                    )
-                },
-            )
-
-        /**
-         * Query only the latest entry for each key, omitting older entries if the entry was written
-         * to by multiple authors.
-         *
-         * If `opts` is `None`, the default values will be used:
-         *     direction: SortDirection::Asc
-         *     offset: None
-         *     limit: None
-         */
-        fun `singleLatestPerKey`(`opts`: QueryOptions?): Query =
-            FfiConverterTypeQuery.lift(
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_constructor_query_single_latest_per_key(
-                        FfiConverterOptionalTypeQueryOptions.lower(`opts`),
-                        _status,
-                    )
-                },
-            )
-
-        /**
-         * Query only the latest entry for this exact key, omitting older entries if the entry was written
-         * to by multiple authors.
-         */
-        fun `singleLatestPerKeyExact`(`exact`: kotlin.ByteArray): Query =
-            FfiConverterTypeQuery.lift(
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_constructor_query_single_latest_per_key_exact(
-                        FfiConverterByteArray.lower(`exact`),
-                        _status,
-                    )
-                },
-            )
-
-        /**
-         * Query only the latest entry for each key, with this prefix, omitting older entries if the entry was written
-         * to by multiple authors.
-         *
-         * If `opts` is `None`, the default values will be used:
-         *     direction: SortDirection::Asc
-         *     offset: None
-         *     limit: None
-         */
-        fun `singleLatestPerKeyPrefix`(
-            `prefix`: kotlin.ByteArray,
-            `opts`: QueryOptions?,
-        ): Query =
-            FfiConverterTypeQuery.lift(
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_constructor_query_single_latest_per_key_prefix(
-                        FfiConverterByteArray.lower(`prefix`),
-                        FfiConverterOptionalTypeQueryOptions.lower(`opts`),
-                        _status,
-                    )
-                },
-            )
+     */override fun `offset`(): kotlin.ULong {
+            return FfiConverterULong.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_query_offset(
+        it, _status)
+}
     }
+    )
+    }
+    
+
+    
+
+    
+    companion object {
+        
+    /**
+     * Query all records.
+     *
+     * If `opts` is `None`, the default values will be used:
+     *     sort_by: SortBy::AuthorKey
+     *     direction: SortDirection::Asc
+     *     offset: None
+     *     limit: None
+     */ fun `all`(`opts`: QueryOptions?): Query {
+            return FfiConverterTypeQuery.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_constructor_query_all(
+        FfiConverterOptionalTypeQueryOptions.lower(`opts`),_status)
+}
+    )
+    }
+    
+
+        
+    /**
+     * Query all entries for by a single author.
+     *
+     * If `opts` is `None`, the default values will be used:
+     *     sort_by: SortBy::AuthorKey
+     *     direction: SortDirection::Asc
+     *     offset: None
+     *     limit: None
+     */ fun `author`(`author`: AuthorId, `opts`: QueryOptions?): Query {
+            return FfiConverterTypeQuery.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_constructor_query_author(
+        FfiConverterTypeAuthorId.lower(`author`),FfiConverterOptionalTypeQueryOptions.lower(`opts`),_status)
+}
+    )
+    }
+    
+
+        
+    /**
+     * Create a Query for a single key and author.
+     */ fun `authorKeyExact`(`author`: AuthorId, `key`: kotlin.ByteArray): Query {
+            return FfiConverterTypeQuery.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_constructor_query_author_key_exact(
+        FfiConverterTypeAuthorId.lower(`author`),FfiConverterByteArray.lower(`key`),_status)
+}
+    )
+    }
+    
+
+        
+    /**
+     * Create a query for all entries of a single author with a given key prefix.
+     *
+     * If `opts` is `None`, the default values will be used:
+     *     direction: SortDirection::Asc
+     *     offset: None
+     *     limit: None
+     */ fun `authorKeyPrefix`(`author`: AuthorId, `prefix`: kotlin.ByteArray, `opts`: QueryOptions?): Query {
+            return FfiConverterTypeQuery.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_constructor_query_author_key_prefix(
+        FfiConverterTypeAuthorId.lower(`author`),FfiConverterByteArray.lower(`prefix`),FfiConverterOptionalTypeQueryOptions.lower(`opts`),_status)
+}
+    )
+    }
+    
+
+        
+    /**
+     * Query all entries that have an exact key.
+     *
+     * If `opts` is `None`, the default values will be used:
+     *     sort_by: SortBy::AuthorKey
+     *     direction: SortDirection::Asc
+     *     offset: None
+     *     limit: None
+     */ fun `keyExact`(`key`: kotlin.ByteArray, `opts`: QueryOptions?): Query {
+            return FfiConverterTypeQuery.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_constructor_query_key_exact(
+        FfiConverterByteArray.lower(`key`),FfiConverterOptionalTypeQueryOptions.lower(`opts`),_status)
+}
+    )
+    }
+    
+
+        
+    /**
+     * Create a query for all entries with a given key prefix.
+     *
+     * If `opts` is `None`, the default values will be used:
+     *     sort_by: SortBy::AuthorKey
+     *     direction: SortDirection::Asc
+     *     offset: None
+     *     limit: None
+     */ fun `keyPrefix`(`prefix`: kotlin.ByteArray, `opts`: QueryOptions?): Query {
+            return FfiConverterTypeQuery.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_constructor_query_key_prefix(
+        FfiConverterByteArray.lower(`prefix`),FfiConverterOptionalTypeQueryOptions.lower(`opts`),_status)
+}
+    )
+    }
+    
+
+        
+    /**
+     * Query only the latest entry for each key, omitting older entries if the entry was written
+     * to by multiple authors.
+     *
+     * If `opts` is `None`, the default values will be used:
+     *     direction: SortDirection::Asc
+     *     offset: None
+     *     limit: None
+     */ fun `singleLatestPerKey`(`opts`: QueryOptions?): Query {
+            return FfiConverterTypeQuery.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_constructor_query_single_latest_per_key(
+        FfiConverterOptionalTypeQueryOptions.lower(`opts`),_status)
+}
+    )
+    }
+    
+
+        
+    /**
+     * Query only the latest entry for this exact key, omitting older entries if the entry was written
+     * to by multiple authors.
+     */ fun `singleLatestPerKeyExact`(`exact`: kotlin.ByteArray): Query {
+            return FfiConverterTypeQuery.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_constructor_query_single_latest_per_key_exact(
+        FfiConverterByteArray.lower(`exact`),_status)
+}
+    )
+    }
+    
+
+        
+    /**
+     * Query only the latest entry for each key, with this prefix, omitting older entries if the entry was written
+     * to by multiple authors.
+     *
+     * If `opts` is `None`, the default values will be used:
+     *     direction: SortDirection::Asc
+     *     offset: None
+     *     limit: None
+     */ fun `singleLatestPerKeyPrefix`(`prefix`: kotlin.ByteArray, `opts`: QueryOptions?): Query {
+            return FfiConverterTypeQuery.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_constructor_query_single_latest_per_key_prefix(
+        FfiConverterByteArray.lower(`prefix`),FfiConverterOptionalTypeQueryOptions.lower(`opts`),_status)
+}
+    )
+    }
+    
+
+        
+    }
+    
 }
 
-public object FfiConverterTypeQuery : FfiConverter<Query, Pointer> {
-    override fun lower(value: Query): Pointer = value.uniffiClonePointer()
+public object FfiConverterTypeQuery: FfiConverter<Query, Pointer> {
 
-    override fun lift(value: Pointer): Query = Query(value)
+    override fun lower(value: Query): Pointer {
+        return value.uniffiClonePointer()
+    }
+
+    override fun lift(value: Pointer): Query {
+        return Query(value)
+    }
 
     override fun read(buf: ByteBuffer): Query {
         // The Rust code always writes pointers as 8 bytes, and will
@@ -13134,15 +12439,13 @@ public object FfiConverterTypeQuery : FfiConverter<Query, Pointer> {
 
     override fun allocationSize(value: Query) = 8UL
 
-    override fun write(
-        value: Query,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: Query, buf: ByteBuffer) {
         // The Rust code always expects pointers written as 8 bytes,
         // and will fail to compile if they don't fit.
         buf.putLong(Pointer.nativeValue(lower(value)))
     }
 }
+
 
 // This template implements a class for working with a Rust struct via a Pointer/Arc<T>
 // to the live Rust struct on the other side of the FFI.
@@ -13241,30 +12544,30 @@ public object FfiConverterTypeQuery : FfiConverter<Query, Pointer> {
 // [1] https://stackoverflow.com/questions/24376768/can-java-finalize-an-object-when-it-is-still-in-scope/24380219
 //
 
+
 /**
  * A chunk range specification as a sequence of chunk offsets
  */
 public interface RangeSpecInterface {
+    
     /**
      * Check if this [`RangeSpec`] selects all chunks in the blob
      */
     fun `isAll`(): kotlin.Boolean
-
+    
     /**
      * Checks if this [`RangeSpec`] does not select any chunks in the blob
      */
     fun `isEmpty`(): kotlin.Boolean
-
+    
     companion object
 }
 
 /**
  * A chunk range specification as a sequence of chunk offsets
  */
-open class RangeSpec :
-    Disposable,
-    AutoCloseable,
-    RangeSpecInterface {
+open class RangeSpec: Disposable, AutoCloseable, RangeSpecInterface {
+
     constructor(pointer: Pointer) {
         this.pointer = pointer
         this.cleanable = UniffiLib.CLEANER.register(this, UniffiCleanAction(pointer))
@@ -13314,7 +12617,7 @@ open class RangeSpec :
             if (c == Long.MAX_VALUE) {
                 throw IllegalStateException("${this.javaClass.simpleName} call counter would overflow")
             }
-        } while (!this.callCounter.compareAndSet(c, c + 1L))
+        } while (! this.callCounter.compareAndSet(c, c + 1L))
         // Now we can safely do the method call without the pointer being freed concurrently.
         try {
             return block(this.uniffiClonePointer())
@@ -13328,9 +12631,7 @@ open class RangeSpec :
 
     // Use a static inner class instead of a closure so as not to accidentally
     // capture `this` as part of the cleanable's action.
-    private class UniffiCleanAction(
-        private val pointer: Pointer?,
-    ) : Runnable {
+    private class UniffiCleanAction(private val pointer: Pointer?) : Runnable {
         override fun run() {
             pointer?.let { ptr ->
                 uniffiRustCall { status ->
@@ -13340,48 +12641,59 @@ open class RangeSpec :
         }
     }
 
-    fun uniffiClonePointer(): Pointer =
-        uniffiRustCall { status ->
+    fun uniffiClonePointer(): Pointer {
+        return uniffiRustCall() { status ->
             UniffiLib.INSTANCE.uniffi_iroh_fn_clone_rangespec(pointer!!, status)
         }
+    }
 
+    
     /**
      * Check if this [`RangeSpec`] selects all chunks in the blob
-     */
-    override fun `isAll`(): kotlin.Boolean =
-        FfiConverterBoolean.lift(
-            callWithPointer {
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_rangespec_is_all(
-                        it,
-                        _status,
-                    )
-                }
-            },
-        )
+     */override fun `isAll`(): kotlin.Boolean {
+            return FfiConverterBoolean.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_rangespec_is_all(
+        it, _status)
+}
+    }
+    )
+    }
+    
 
+    
     /**
      * Checks if this [`RangeSpec`] does not select any chunks in the blob
-     */
-    override fun `isEmpty`(): kotlin.Boolean =
-        FfiConverterBoolean.lift(
-            callWithPointer {
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_method_rangespec_is_empty(
-                        it,
-                        _status,
-                    )
-                }
-            },
-        )
+     */override fun `isEmpty`(): kotlin.Boolean {
+            return FfiConverterBoolean.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_rangespec_is_empty(
+        it, _status)
+}
+    }
+    )
+    }
+    
 
+    
+
+    
+    
     companion object
+    
 }
 
-public object FfiConverterTypeRangeSpec : FfiConverter<RangeSpec, Pointer> {
-    override fun lower(value: RangeSpec): Pointer = value.uniffiClonePointer()
+public object FfiConverterTypeRangeSpec: FfiConverter<RangeSpec, Pointer> {
 
-    override fun lift(value: Pointer): RangeSpec = RangeSpec(value)
+    override fun lower(value: RangeSpec): Pointer {
+        return value.uniffiClonePointer()
+    }
+
+    override fun lift(value: Pointer): RangeSpec {
+        return RangeSpec(value)
+    }
 
     override fun read(buf: ByteBuffer): RangeSpec {
         // The Rust code always writes pointers as 8 bytes, and will
@@ -13391,15 +12703,13 @@ public object FfiConverterTypeRangeSpec : FfiConverter<RangeSpec, Pointer> {
 
     override fun allocationSize(value: RangeSpec) = 8UL
 
-    override fun write(
-        value: RangeSpec,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: RangeSpec, buf: ByteBuffer) {
         // The Rust code always expects pointers written as 8 bytes,
         // and will fail to compile if they don't fit.
         buf.putLong(Pointer.nativeValue(lower(value)))
     }
 }
+
 
 // This template implements a class for working with a Rust struct via a Pointer/Arc<T>
 // to the live Rust struct on the other side of the FFI.
@@ -13498,20 +12808,20 @@ public object FfiConverterTypeRangeSpec : FfiConverter<RangeSpec, Pointer> {
 // [1] https://stackoverflow.com/questions/24376768/can-java-finalize-an-object-when-it-is-still-in-scope/24380219
 //
 
+
 /**
  * An option for commands that allow setting a tag
  */
 public interface SetTagOptionInterface {
+    
     companion object
 }
 
 /**
  * An option for commands that allow setting a tag
  */
-open class SetTagOption :
-    Disposable,
-    AutoCloseable,
-    SetTagOptionInterface {
+open class SetTagOption: Disposable, AutoCloseable, SetTagOptionInterface {
+
     constructor(pointer: Pointer) {
         this.pointer = pointer
         this.cleanable = UniffiLib.CLEANER.register(this, UniffiCleanAction(pointer))
@@ -13561,7 +12871,7 @@ open class SetTagOption :
             if (c == Long.MAX_VALUE) {
                 throw IllegalStateException("${this.javaClass.simpleName} call counter would overflow")
             }
-        } while (!this.callCounter.compareAndSet(c, c + 1L))
+        } while (! this.callCounter.compareAndSet(c, c + 1L))
         // Now we can safely do the method call without the pointer being freed concurrently.
         try {
             return block(this.uniffiClonePointer())
@@ -13575,9 +12885,7 @@ open class SetTagOption :
 
     // Use a static inner class instead of a closure so as not to accidentally
     // capture `this` as part of the cleanable's action.
-    private class UniffiCleanAction(
-        private val pointer: Pointer?,
-    ) : Runnable {
+    private class UniffiCleanAction(private val pointer: Pointer?) : Runnable {
         override fun run() {
             pointer?.let { ptr ->
                 uniffiRustCall { status ->
@@ -13587,43 +12895,56 @@ open class SetTagOption :
         }
     }
 
-    fun uniffiClonePointer(): Pointer =
-        uniffiRustCall { status ->
+    fun uniffiClonePointer(): Pointer {
+        return uniffiRustCall() { status ->
             UniffiLib.INSTANCE.uniffi_iroh_fn_clone_settagoption(pointer!!, status)
         }
-
-    companion object {
-        /**
-         * Indicate you want an automatically generated tag
-         */
-        fun `auto`(): SetTagOption =
-            FfiConverterTypeSetTagOption.lift(
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_constructor_settagoption_auto(
-                        _status,
-                    )
-                },
-            )
-
-        /**
-         * Indicate you want a named tag
-         */
-        fun `named`(`tag`: kotlin.ByteArray): SetTagOption =
-            FfiConverterTypeSetTagOption.lift(
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_constructor_settagoption_named(
-                        FfiConverterByteArray.lower(`tag`),
-                        _status,
-                    )
-                },
-            )
     }
+
+    
+
+    
+    companion object {
+        
+    /**
+     * Indicate you want an automatically generated tag
+     */ fun `auto`(): SetTagOption {
+            return FfiConverterTypeSetTagOption.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_constructor_settagoption_auto(
+        _status)
+}
+    )
+    }
+    
+
+        
+    /**
+     * Indicate you want a named tag
+     */ fun `named`(`tag`: kotlin.ByteArray): SetTagOption {
+            return FfiConverterTypeSetTagOption.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_constructor_settagoption_named(
+        FfiConverterByteArray.lower(`tag`),_status)
+}
+    )
+    }
+    
+
+        
+    }
+    
 }
 
-public object FfiConverterTypeSetTagOption : FfiConverter<SetTagOption, Pointer> {
-    override fun lower(value: SetTagOption): Pointer = value.uniffiClonePointer()
+public object FfiConverterTypeSetTagOption: FfiConverter<SetTagOption, Pointer> {
 
-    override fun lift(value: Pointer): SetTagOption = SetTagOption(value)
+    override fun lower(value: SetTagOption): Pointer {
+        return value.uniffiClonePointer()
+    }
+
+    override fun lift(value: Pointer): SetTagOption {
+        return SetTagOption(value)
+    }
 
     override fun read(buf: ByteBuffer): SetTagOption {
         // The Rust code always writes pointers as 8 bytes, and will
@@ -13633,15 +12954,13 @@ public object FfiConverterTypeSetTagOption : FfiConverter<SetTagOption, Pointer>
 
     override fun allocationSize(value: SetTagOption) = 8UL
 
-    override fun write(
-        value: SetTagOption,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: SetTagOption, buf: ByteBuffer) {
         // The Rust code always expects pointers written as 8 bytes,
         // and will fail to compile if they don't fit.
         buf.putLong(Pointer.nativeValue(lower(value)))
     }
 }
+
 
 // This template implements a class for working with a Rust struct via a Pointer/Arc<T>
 // to the live Rust struct on the other side of the FFI.
@@ -13740,14 +13059,16 @@ public object FfiConverterTypeSetTagOption : FfiConverter<SetTagOption, Pointer>
 // [1] https://stackoverflow.com/questions/24376768/can-java-finalize-an-object-when-it-is-still-in-scope/24380219
 //
 
+
 /**
  * The `progress` method will be called for each `SubscribeProgress` event that is
  * emitted during a `node.doc_subscribe`. Use the `SubscribeProgress.type()`
  * method to check the `LiveEvent`
  */
 public interface SubscribeCallback {
+    
     fun `event`(`event`: LiveEvent)
-
+    
     companion object
 }
 
@@ -13756,10 +13077,8 @@ public interface SubscribeCallback {
  * emitted during a `node.doc_subscribe`. Use the `SubscribeProgress.type()`
  * method to check the `LiveEvent`
  */
-open class SubscribeCallbackImpl :
-    Disposable,
-    AutoCloseable,
-    SubscribeCallback {
+open class SubscribeCallbackImpl: Disposable, AutoCloseable, SubscribeCallback {
+
     constructor(pointer: Pointer) {
         this.pointer = pointer
         this.cleanable = UniffiLib.CLEANER.register(this, UniffiCleanAction(pointer))
@@ -13809,7 +13128,7 @@ open class SubscribeCallbackImpl :
             if (c == Long.MAX_VALUE) {
                 throw IllegalStateException("${this.javaClass.simpleName} call counter would overflow")
             }
-        } while (!this.callCounter.compareAndSet(c, c + 1L))
+        } while (! this.callCounter.compareAndSet(c, c + 1L))
         // Now we can safely do the method call without the pointer being freed concurrently.
         try {
             return block(this.uniffiClonePointer())
@@ -13823,9 +13142,7 @@ open class SubscribeCallbackImpl :
 
     // Use a static inner class instead of a closure so as not to accidentally
     // capture `this` as part of the cleanable's action.
-    private class UniffiCleanAction(
-        private val pointer: Pointer?,
-    ) : Runnable {
+    private class UniffiCleanAction(private val pointer: Pointer?) : Runnable {
         override fun run() {
             pointer?.let { ptr ->
                 uniffiRustCall { status ->
@@ -13835,63 +13152,63 @@ open class SubscribeCallbackImpl :
         }
     }
 
-    fun uniffiClonePointer(): Pointer =
-        uniffiRustCall { status ->
+    fun uniffiClonePointer(): Pointer {
+        return uniffiRustCall() { status ->
             UniffiLib.INSTANCE.uniffi_iroh_fn_clone_subscribecallback(pointer!!, status)
         }
+    }
 
-    @Throws(
-        CallbackException::class,
-        )
-    override fun `event`(`event`: LiveEvent) =
-        callWithPointer {
-            uniffiRustCallWithError(CallbackException) { _status ->
-                UniffiLib.INSTANCE.uniffi_iroh_fn_method_subscribecallback_event(
-                    it,
-                    FfiConverterTypeLiveEvent.lower(`event`),
-                    _status,
-                )
-            }
-        }
-
-    companion object
+    
+    @Throws(CallbackException::class)override fun `event`(`event`: LiveEvent)
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(CallbackException) { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_method_subscribecallback_event(
+        it, FfiConverterTypeLiveEvent.lower(`event`),_status)
 }
+    }
+    
+    
+
+    
+
+    
+    
+    companion object
+    
+}
+
 
 // Put the implementation in an object so we don't pollute the top-level namespace
 internal object uniffiCallbackInterfaceSubscribeCallback {
-    internal object `event` : UniffiCallbackInterfaceSubscribeCallbackMethod0 {
-        override fun callback(
-            `uniffiHandle`: Long,
-            `event`: Pointer,
-            `uniffiOutReturn`: Pointer,
-            uniffiCallStatus: UniffiRustCallStatus,
-        ) {
+    internal object `event`: UniffiCallbackInterfaceSubscribeCallbackMethod0 {
+        override fun callback(`uniffiHandle`: Long,`event`: Pointer,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,) {
             val uniffiObj = FfiConverterTypeSubscribeCallback.handleMap.get(uniffiHandle)
-            val makeCall = {  uniffiObj.`event`(
-                FfiConverterTypeLiveEvent.lift(`event`),
-            )
+            val makeCall = { ->
+                uniffiObj.`event`(
+                    FfiConverterTypeLiveEvent.lift(`event`),
+                )
             }
             val writeReturn = { _: Unit -> Unit }
             uniffiTraitInterfaceCallWithError(
                 uniffiCallStatus,
                 makeCall,
                 writeReturn,
-                { e: CallbackException -> FfiConverterTypeCallbackError.lower(e) },
+                { e: CallbackException -> FfiConverterTypeCallbackError.lower(e) }
             )
         }
     }
 
-    internal object uniffiFree : UniffiCallbackInterfaceFree {
+    internal object uniffiFree: UniffiCallbackInterfaceFree {
         override fun callback(handle: Long) {
             FfiConverterTypeSubscribeCallback.handleMap.remove(handle)
         }
     }
 
-    internal var vtable =
-        UniffiVTableCallbackInterfaceSubscribeCallback.UniffiByValue(
-            `event`,
-            uniffiFree,
-        )
+    internal var vtable = UniffiVTableCallbackInterfaceSubscribeCallback.UniffiByValue(
+        `event`,
+        uniffiFree,
+    )
 
     // Registers the foreign callback with the Rust side.
     // This method is generated for each callback interface.
@@ -13900,12 +13217,16 @@ internal object uniffiCallbackInterfaceSubscribeCallback {
     }
 }
 
-public object FfiConverterTypeSubscribeCallback : FfiConverter<SubscribeCallback, Pointer> {
+public object FfiConverterTypeSubscribeCallback: FfiConverter<SubscribeCallback, Pointer> {
     internal val handleMap = UniffiHandleMap<SubscribeCallback>()
 
-    override fun lower(value: SubscribeCallback): Pointer = Pointer(handleMap.insert(value))
+    override fun lower(value: SubscribeCallback): Pointer {
+        return Pointer(handleMap.insert(value))
+    }
 
-    override fun lift(value: Pointer): SubscribeCallback = SubscribeCallbackImpl(value)
+    override fun lift(value: Pointer): SubscribeCallback {
+        return SubscribeCallbackImpl(value)
+    }
 
     override fun read(buf: ByteBuffer): SubscribeCallback {
         // The Rust code always writes pointers as 8 bytes, and will
@@ -13915,15 +13236,13 @@ public object FfiConverterTypeSubscribeCallback : FfiConverter<SubscribeCallback
 
     override fun allocationSize(value: SubscribeCallback) = 8UL
 
-    override fun write(
-        value: SubscribeCallback,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: SubscribeCallback, buf: ByteBuffer) {
         // The Rust code always expects pointers written as 8 bytes,
         // and will fail to compile if they don't fit.
         buf.putLong(Pointer.nativeValue(lower(value)))
     }
 }
+
 
 // This template implements a class for working with a Rust struct via a Pointer/Arc<T>
 // to the live Rust struct on the other side of the FFI.
@@ -14022,20 +13341,20 @@ public object FfiConverterTypeSubscribeCallback : FfiConverter<SubscribeCallback
 // [1] https://stackoverflow.com/questions/24376768/can-java-finalize-an-object-when-it-is-still-in-scope/24380219
 //
 
+
 /**
  * Whether to wrap the added data in a collection.
  */
 public interface WrapOptionInterface {
+    
     companion object
 }
 
 /**
  * Whether to wrap the added data in a collection.
  */
-open class WrapOption :
-    Disposable,
-    AutoCloseable,
-    WrapOptionInterface {
+open class WrapOption: Disposable, AutoCloseable, WrapOptionInterface {
+
     constructor(pointer: Pointer) {
         this.pointer = pointer
         this.cleanable = UniffiLib.CLEANER.register(this, UniffiCleanAction(pointer))
@@ -14085,7 +13404,7 @@ open class WrapOption :
             if (c == Long.MAX_VALUE) {
                 throw IllegalStateException("${this.javaClass.simpleName} call counter would overflow")
             }
-        } while (!this.callCounter.compareAndSet(c, c + 1L))
+        } while (! this.callCounter.compareAndSet(c, c + 1L))
         // Now we can safely do the method call without the pointer being freed concurrently.
         try {
             return block(this.uniffiClonePointer())
@@ -14099,9 +13418,7 @@ open class WrapOption :
 
     // Use a static inner class instead of a closure so as not to accidentally
     // capture `this` as part of the cleanable's action.
-    private class UniffiCleanAction(
-        private val pointer: Pointer?,
-    ) : Runnable {
+    private class UniffiCleanAction(private val pointer: Pointer?) : Runnable {
         override fun run() {
             pointer?.let { ptr ->
                 uniffiRustCall { status ->
@@ -14111,43 +13428,56 @@ open class WrapOption :
         }
     }
 
-    fun uniffiClonePointer(): Pointer =
-        uniffiRustCall { status ->
+    fun uniffiClonePointer(): Pointer {
+        return uniffiRustCall() { status ->
             UniffiLib.INSTANCE.uniffi_iroh_fn_clone_wrapoption(pointer!!, status)
         }
-
-    companion object {
-        /**
-         * Indicate you do not wrap the file or directory.
-         */
-        fun `noWrap`(): WrapOption =
-            FfiConverterTypeWrapOption.lift(
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_constructor_wrapoption_no_wrap(
-                        _status,
-                    )
-                },
-            )
-
-        /**
-         * Indicate you want to wrap the file or directory in a colletion, with an optional name
-         */
-        fun `wrap`(`name`: kotlin.String?): WrapOption =
-            FfiConverterTypeWrapOption.lift(
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_iroh_fn_constructor_wrapoption_wrap(
-                        FfiConverterOptionalString.lower(`name`),
-                        _status,
-                    )
-                },
-            )
     }
+
+    
+
+    
+    companion object {
+        
+    /**
+     * Indicate you do not wrap the file or directory.
+     */ fun `noWrap`(): WrapOption {
+            return FfiConverterTypeWrapOption.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_constructor_wrapoption_no_wrap(
+        _status)
+}
+    )
+    }
+    
+
+        
+    /**
+     * Indicate you want to wrap the file or directory in a colletion, with an optional name
+     */ fun `wrap`(`name`: kotlin.String?): WrapOption {
+            return FfiConverterTypeWrapOption.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_constructor_wrapoption_wrap(
+        FfiConverterOptionalString.lower(`name`),_status)
+}
+    )
+    }
+    
+
+        
+    }
+    
 }
 
-public object FfiConverterTypeWrapOption : FfiConverter<WrapOption, Pointer> {
-    override fun lower(value: WrapOption): Pointer = value.uniffiClonePointer()
+public object FfiConverterTypeWrapOption: FfiConverter<WrapOption, Pointer> {
 
-    override fun lift(value: Pointer): WrapOption = WrapOption(value)
+    override fun lower(value: WrapOption): Pointer {
+        return value.uniffiClonePointer()
+    }
+
+    override fun lift(value: Pointer): WrapOption {
+        return WrapOption(value)
+    }
 
     override fun read(buf: ByteBuffer): WrapOption {
         // The Rust code always writes pointers as 8 bytes, and will
@@ -14157,464 +13487,476 @@ public object FfiConverterTypeWrapOption : FfiConverter<WrapOption, Pointer> {
 
     override fun allocationSize(value: WrapOption) = 8UL
 
-    override fun write(
-        value: WrapOption,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: WrapOption, buf: ByteBuffer) {
         // The Rust code always expects pointers written as 8 bytes,
         // and will fail to compile if they don't fit.
         buf.putLong(Pointer.nativeValue(lower(value)))
     }
 }
 
+
+
 /**
  * An AddProgress event indicating we got an error and need to abort
  */
-data class AddProgressAbort(
+data class AddProgressAbort (
     /**
      * The error message
      */
-    var `error`: kotlin.String,
+    var `error`: kotlin.String
 ) {
+    
     companion object
 }
 
-public object FfiConverterTypeAddProgressAbort : FfiConverterRustBuffer<AddProgressAbort> {
-    override fun read(buf: ByteBuffer): AddProgressAbort =
-        AddProgressAbort(
+public object FfiConverterTypeAddProgressAbort: FfiConverterRustBuffer<AddProgressAbort> {
+    override fun read(buf: ByteBuffer): AddProgressAbort {
+        return AddProgressAbort(
             FfiConverterString.read(buf),
         )
+    }
 
-    override fun allocationSize(value: AddProgressAbort) =
-        (
+    override fun allocationSize(value: AddProgressAbort) = (
             FfiConverterString.allocationSize(value.`error`)
-        )
+    )
 
-    override fun write(
-        value: AddProgressAbort,
-        buf: ByteBuffer,
-    ) {
-        FfiConverterString.write(value.`error`, buf)
+    override fun write(value: AddProgressAbort, buf: ByteBuffer) {
+            FfiConverterString.write(value.`error`, buf)
     }
 }
+
+
 
 /**
  * An AddProgress event indicating we are done with the the whole operation
  */
-data class AddProgressAllDone(
+data class AddProgressAllDone (
     /**
      * The hash of the created data.
      */
-    var `hash`: Hash,
+    var `hash`: Hash, 
     /**
      * The format of the added data.
      */
-    var `format`: BlobFormat,
+    var `format`: BlobFormat, 
     /**
      * The tag of the added data.
      */
-    var `tag`: kotlin.ByteArray,
+    var `tag`: kotlin.ByteArray
 ) : Disposable {
+    
     @Suppress("UNNECESSARY_SAFE_CALL") // codegen is much simpler if we unconditionally emit safe calls here
     override fun destroy() {
+        
         Disposable.destroy(this.`hash`)
-
+    
         Disposable.destroy(this.`format`)
-
+    
         Disposable.destroy(this.`tag`)
+    
     }
-
+    
     companion object
 }
 
-public object FfiConverterTypeAddProgressAllDone : FfiConverterRustBuffer<AddProgressAllDone> {
-    override fun read(buf: ByteBuffer): AddProgressAllDone =
-        AddProgressAllDone(
+public object FfiConverterTypeAddProgressAllDone: FfiConverterRustBuffer<AddProgressAllDone> {
+    override fun read(buf: ByteBuffer): AddProgressAllDone {
+        return AddProgressAllDone(
             FfiConverterTypeHash.read(buf),
             FfiConverterTypeBlobFormat.read(buf),
             FfiConverterByteArray.read(buf),
         )
+    }
 
-    override fun allocationSize(value: AddProgressAllDone) =
-        (
+    override fun allocationSize(value: AddProgressAllDone) = (
             FfiConverterTypeHash.allocationSize(value.`hash`) +
-                FfiConverterTypeBlobFormat.allocationSize(value.`format`) +
-                FfiConverterByteArray.allocationSize(value.`tag`)
-        )
+            FfiConverterTypeBlobFormat.allocationSize(value.`format`) +
+            FfiConverterByteArray.allocationSize(value.`tag`)
+    )
 
-    override fun write(
-        value: AddProgressAllDone,
-        buf: ByteBuffer,
-    ) {
-        FfiConverterTypeHash.write(value.`hash`, buf)
-        FfiConverterTypeBlobFormat.write(value.`format`, buf)
-        FfiConverterByteArray.write(value.`tag`, buf)
+    override fun write(value: AddProgressAllDone, buf: ByteBuffer) {
+            FfiConverterTypeHash.write(value.`hash`, buf)
+            FfiConverterTypeBlobFormat.write(value.`format`, buf)
+            FfiConverterByteArray.write(value.`tag`, buf)
     }
 }
+
+
 
 /**
  * An AddProgress event indicated we are done with `id` and now have a hash `hash`
  */
-data class AddProgressDone(
+data class AddProgressDone (
     /**
      * The unique id of the entry.
      */
-    var `id`: kotlin.ULong,
+    var `id`: kotlin.ULong, 
     /**
      * The hash of the entry.
      */
-    var `hash`: Hash,
+    var `hash`: Hash
 ) : Disposable {
+    
     @Suppress("UNNECESSARY_SAFE_CALL") // codegen is much simpler if we unconditionally emit safe calls here
     override fun destroy() {
+        
         Disposable.destroy(this.`id`)
-
+    
         Disposable.destroy(this.`hash`)
+    
     }
-
+    
     companion object
 }
 
-public object FfiConverterTypeAddProgressDone : FfiConverterRustBuffer<AddProgressDone> {
-    override fun read(buf: ByteBuffer): AddProgressDone =
-        AddProgressDone(
+public object FfiConverterTypeAddProgressDone: FfiConverterRustBuffer<AddProgressDone> {
+    override fun read(buf: ByteBuffer): AddProgressDone {
+        return AddProgressDone(
             FfiConverterULong.read(buf),
             FfiConverterTypeHash.read(buf),
         )
+    }
 
-    override fun allocationSize(value: AddProgressDone) =
-        (
+    override fun allocationSize(value: AddProgressDone) = (
             FfiConverterULong.allocationSize(value.`id`) +
-                FfiConverterTypeHash.allocationSize(value.`hash`)
-        )
+            FfiConverterTypeHash.allocationSize(value.`hash`)
+    )
 
-    override fun write(
-        value: AddProgressDone,
-        buf: ByteBuffer,
-    ) {
-        FfiConverterULong.write(value.`id`, buf)
-        FfiConverterTypeHash.write(value.`hash`, buf)
+    override fun write(value: AddProgressDone, buf: ByteBuffer) {
+            FfiConverterULong.write(value.`id`, buf)
+            FfiConverterTypeHash.write(value.`hash`, buf)
     }
 }
+
+
 
 /**
  * An AddProgress event indicating an item was found with name `name`, that can be referred to by `id`
  */
-data class AddProgressFound(
+data class AddProgressFound (
     /**
      * A new unique id for this entry.
      */
-    var `id`: kotlin.ULong,
+    var `id`: kotlin.ULong, 
     /**
      * The name of the entry.
      */
-    var `name`: kotlin.String,
+    var `name`: kotlin.String, 
     /**
      * The size of the entry in bytes.
      */
-    var `size`: kotlin.ULong,
+    var `size`: kotlin.ULong
 ) {
+    
     companion object
 }
 
-public object FfiConverterTypeAddProgressFound : FfiConverterRustBuffer<AddProgressFound> {
-    override fun read(buf: ByteBuffer): AddProgressFound =
-        AddProgressFound(
+public object FfiConverterTypeAddProgressFound: FfiConverterRustBuffer<AddProgressFound> {
+    override fun read(buf: ByteBuffer): AddProgressFound {
+        return AddProgressFound(
             FfiConverterULong.read(buf),
             FfiConverterString.read(buf),
             FfiConverterULong.read(buf),
         )
+    }
 
-    override fun allocationSize(value: AddProgressFound) =
-        (
+    override fun allocationSize(value: AddProgressFound) = (
             FfiConverterULong.allocationSize(value.`id`) +
-                FfiConverterString.allocationSize(value.`name`) +
-                FfiConverterULong.allocationSize(value.`size`)
-        )
+            FfiConverterString.allocationSize(value.`name`) +
+            FfiConverterULong.allocationSize(value.`size`)
+    )
 
-    override fun write(
-        value: AddProgressFound,
-        buf: ByteBuffer,
-    ) {
-        FfiConverterULong.write(value.`id`, buf)
-        FfiConverterString.write(value.`name`, buf)
-        FfiConverterULong.write(value.`size`, buf)
+    override fun write(value: AddProgressFound, buf: ByteBuffer) {
+            FfiConverterULong.write(value.`id`, buf)
+            FfiConverterString.write(value.`name`, buf)
+            FfiConverterULong.write(value.`size`, buf)
     }
 }
+
+
 
 /**
  * An AddProgress event indicating we got progress ingesting item `id`.
  */
-data class AddProgressProgress(
+data class AddProgressProgress (
     /**
      * The unique id of the entry.
      */
-    var `id`: kotlin.ULong,
+    var `id`: kotlin.ULong, 
     /**
      * The offset of the progress, in bytes.
      */
-    var `offset`: kotlin.ULong,
+    var `offset`: kotlin.ULong
 ) {
+    
     companion object
 }
 
-public object FfiConverterTypeAddProgressProgress : FfiConverterRustBuffer<AddProgressProgress> {
-    override fun read(buf: ByteBuffer): AddProgressProgress =
-        AddProgressProgress(
+public object FfiConverterTypeAddProgressProgress: FfiConverterRustBuffer<AddProgressProgress> {
+    override fun read(buf: ByteBuffer): AddProgressProgress {
+        return AddProgressProgress(
             FfiConverterULong.read(buf),
             FfiConverterULong.read(buf),
         )
+    }
 
-    override fun allocationSize(value: AddProgressProgress) =
-        (
+    override fun allocationSize(value: AddProgressProgress) = (
             FfiConverterULong.allocationSize(value.`id`) +
-                FfiConverterULong.allocationSize(value.`offset`)
-        )
+            FfiConverterULong.allocationSize(value.`offset`)
+    )
 
-    override fun write(
-        value: AddProgressProgress,
-        buf: ByteBuffer,
-    ) {
-        FfiConverterULong.write(value.`id`, buf)
-        FfiConverterULong.write(value.`offset`, buf)
+    override fun write(value: AddProgressProgress, buf: ByteBuffer) {
+            FfiConverterULong.write(value.`id`, buf)
+            FfiConverterULong.write(value.`offset`, buf)
     }
 }
+
+
 
 /**
  * Outcome of a blob add operation.
  */
-data class BlobAddOutcome(
+data class BlobAddOutcome (
     /**
      * The hash of the blob
      */
-    var `hash`: Hash,
+    var `hash`: Hash, 
     /**
      * The format the blob
      */
-    var `format`: BlobFormat,
+    var `format`: BlobFormat, 
     /**
      * The size of the blob
      */
-    var `size`: kotlin.ULong,
+    var `size`: kotlin.ULong, 
     /**
      * The tag of the blob
      */
-    var `tag`: kotlin.ByteArray,
+    var `tag`: kotlin.ByteArray
 ) : Disposable {
+    
     @Suppress("UNNECESSARY_SAFE_CALL") // codegen is much simpler if we unconditionally emit safe calls here
     override fun destroy() {
+        
         Disposable.destroy(this.`hash`)
-
+    
         Disposable.destroy(this.`format`)
-
+    
         Disposable.destroy(this.`size`)
-
+    
         Disposable.destroy(this.`tag`)
+    
     }
-
+    
     companion object
 }
 
-public object FfiConverterTypeBlobAddOutcome : FfiConverterRustBuffer<BlobAddOutcome> {
-    override fun read(buf: ByteBuffer): BlobAddOutcome =
-        BlobAddOutcome(
+public object FfiConverterTypeBlobAddOutcome: FfiConverterRustBuffer<BlobAddOutcome> {
+    override fun read(buf: ByteBuffer): BlobAddOutcome {
+        return BlobAddOutcome(
             FfiConverterTypeHash.read(buf),
             FfiConverterTypeBlobFormat.read(buf),
             FfiConverterULong.read(buf),
             FfiConverterByteArray.read(buf),
         )
+    }
 
-    override fun allocationSize(value: BlobAddOutcome) =
-        (
+    override fun allocationSize(value: BlobAddOutcome) = (
             FfiConverterTypeHash.allocationSize(value.`hash`) +
-                FfiConverterTypeBlobFormat.allocationSize(value.`format`) +
-                FfiConverterULong.allocationSize(value.`size`) +
-                FfiConverterByteArray.allocationSize(value.`tag`)
-        )
+            FfiConverterTypeBlobFormat.allocationSize(value.`format`) +
+            FfiConverterULong.allocationSize(value.`size`) +
+            FfiConverterByteArray.allocationSize(value.`tag`)
+    )
 
-    override fun write(
-        value: BlobAddOutcome,
-        buf: ByteBuffer,
-    ) {
-        FfiConverterTypeHash.write(value.`hash`, buf)
-        FfiConverterTypeBlobFormat.write(value.`format`, buf)
-        FfiConverterULong.write(value.`size`, buf)
-        FfiConverterByteArray.write(value.`tag`, buf)
+    override fun write(value: BlobAddOutcome, buf: ByteBuffer) {
+            FfiConverterTypeHash.write(value.`hash`, buf)
+            FfiConverterTypeBlobFormat.write(value.`format`, buf)
+            FfiConverterULong.write(value.`size`, buf)
+            FfiConverterByteArray.write(value.`tag`, buf)
     }
 }
+
+
 
 /**
  * A response to a list blobs request
  */
-data class BlobInfo(
+data class BlobInfo (
     /**
      * Location of the blob
      */
-    var `path`: kotlin.String,
+    var `path`: kotlin.String, 
     /**
      * The hash of the blob
      */
-    var `hash`: Hash,
+    var `hash`: Hash, 
     /**
      * The size of the blob
      */
-    var `size`: kotlin.ULong,
+    var `size`: kotlin.ULong
 ) : Disposable {
+    
     @Suppress("UNNECESSARY_SAFE_CALL") // codegen is much simpler if we unconditionally emit safe calls here
     override fun destroy() {
+        
         Disposable.destroy(this.`path`)
-
+    
         Disposable.destroy(this.`hash`)
-
+    
         Disposable.destroy(this.`size`)
+    
     }
-
+    
     companion object
 }
 
-public object FfiConverterTypeBlobInfo : FfiConverterRustBuffer<BlobInfo> {
-    override fun read(buf: ByteBuffer): BlobInfo =
-        BlobInfo(
+public object FfiConverterTypeBlobInfo: FfiConverterRustBuffer<BlobInfo> {
+    override fun read(buf: ByteBuffer): BlobInfo {
+        return BlobInfo(
             FfiConverterString.read(buf),
             FfiConverterTypeHash.read(buf),
             FfiConverterULong.read(buf),
         )
+    }
 
-    override fun allocationSize(value: BlobInfo) =
-        (
+    override fun allocationSize(value: BlobInfo) = (
             FfiConverterString.allocationSize(value.`path`) +
-                FfiConverterTypeHash.allocationSize(value.`hash`) +
-                FfiConverterULong.allocationSize(value.`size`)
-        )
+            FfiConverterTypeHash.allocationSize(value.`hash`) +
+            FfiConverterULong.allocationSize(value.`size`)
+    )
 
-    override fun write(
-        value: BlobInfo,
-        buf: ByteBuffer,
-    ) {
-        FfiConverterString.write(value.`path`, buf)
-        FfiConverterTypeHash.write(value.`hash`, buf)
-        FfiConverterULong.write(value.`size`, buf)
+    override fun write(value: BlobInfo, buf: ByteBuffer) {
+            FfiConverterString.write(value.`path`, buf)
+            FfiConverterTypeHash.write(value.`hash`, buf)
+            FfiConverterULong.write(value.`size`, buf)
     }
 }
+
+
 
 /**
  * A response to a list collections request
  */
-data class CollectionInfo(
+data class CollectionInfo (
     /**
      * Tag of the collection
      */
-    var `tag`: kotlin.ByteArray,
+    var `tag`: kotlin.ByteArray, 
     /**
      * Hash of the collection
      */
-    var `hash`: Hash,
+    var `hash`: Hash, 
     /**
      * Number of children in the collection
      *
      * This is an optional field, because the data is not always available.
      */
-    var `totalBlobsCount`: kotlin.ULong?,
+    var `totalBlobsCount`: kotlin.ULong?, 
     /**
      * Total size of the raw data referred to by all links
      *
      * This is an optional field, because the data is not always available.
      */
-    var `totalBlobsSize`: kotlin.ULong?,
+    var `totalBlobsSize`: kotlin.ULong?
 ) : Disposable {
+    
     @Suppress("UNNECESSARY_SAFE_CALL") // codegen is much simpler if we unconditionally emit safe calls here
     override fun destroy() {
+        
         Disposable.destroy(this.`tag`)
-
+    
         Disposable.destroy(this.`hash`)
-
+    
         Disposable.destroy(this.`totalBlobsCount`)
-
+    
         Disposable.destroy(this.`totalBlobsSize`)
+    
     }
-
+    
     companion object
 }
 
-public object FfiConverterTypeCollectionInfo : FfiConverterRustBuffer<CollectionInfo> {
-    override fun read(buf: ByteBuffer): CollectionInfo =
-        CollectionInfo(
+public object FfiConverterTypeCollectionInfo: FfiConverterRustBuffer<CollectionInfo> {
+    override fun read(buf: ByteBuffer): CollectionInfo {
+        return CollectionInfo(
             FfiConverterByteArray.read(buf),
             FfiConverterTypeHash.read(buf),
             FfiConverterOptionalULong.read(buf),
             FfiConverterOptionalULong.read(buf),
         )
+    }
 
-    override fun allocationSize(value: CollectionInfo) =
-        (
+    override fun allocationSize(value: CollectionInfo) = (
             FfiConverterByteArray.allocationSize(value.`tag`) +
-                FfiConverterTypeHash.allocationSize(value.`hash`) +
-                FfiConverterOptionalULong.allocationSize(value.`totalBlobsCount`) +
-                FfiConverterOptionalULong.allocationSize(value.`totalBlobsSize`)
-        )
+            FfiConverterTypeHash.allocationSize(value.`hash`) +
+            FfiConverterOptionalULong.allocationSize(value.`totalBlobsCount`) +
+            FfiConverterOptionalULong.allocationSize(value.`totalBlobsSize`)
+    )
 
-    override fun write(
-        value: CollectionInfo,
-        buf: ByteBuffer,
-    ) {
-        FfiConverterByteArray.write(value.`tag`, buf)
-        FfiConverterTypeHash.write(value.`hash`, buf)
-        FfiConverterOptionalULong.write(value.`totalBlobsCount`, buf)
-        FfiConverterOptionalULong.write(value.`totalBlobsSize`, buf)
+    override fun write(value: CollectionInfo, buf: ByteBuffer) {
+            FfiConverterByteArray.write(value.`tag`, buf)
+            FfiConverterTypeHash.write(value.`hash`, buf)
+            FfiConverterOptionalULong.write(value.`totalBlobsCount`, buf)
+            FfiConverterOptionalULong.write(value.`totalBlobsSize`, buf)
     }
 }
+
+
 
 /**
  * Information about a connection
  */
-data class ConnectionInfo(
+data class ConnectionInfo (
     /**
      * The node identifier of the endpoint. Also a public key.
      */
-    var `nodeId`: PublicKey,
+    var `nodeId`: PublicKey, 
     /**
      * Relay url, if available.
      */
-    var `relayUrl`: kotlin.String?,
+    var `relayUrl`: kotlin.String?, 
     /**
      * List of addresses at which this node might be reachable, plus any latency information we
      * have about that address and the last time the address was used.
      */
-    var `addrs`: List<DirectAddrInfo>,
+    var `addrs`: List<DirectAddrInfo>, 
     /**
      * The type of connection we have to the peer, either direct or over relay.
      */
-    var `connType`: ConnectionType,
+    var `connType`: ConnectionType, 
     /**
      * The latency of the `conn_type`.
      */
-    var `latency`: java.time.Duration?,
+    var `latency`: java.time.Duration?, 
     /**
      * Duration since the last time this peer was used.
      */
-    var `lastUsed`: java.time.Duration?,
+    var `lastUsed`: java.time.Duration?
 ) : Disposable {
+    
     @Suppress("UNNECESSARY_SAFE_CALL") // codegen is much simpler if we unconditionally emit safe calls here
     override fun destroy() {
+        
         Disposable.destroy(this.`nodeId`)
-
+    
         Disposable.destroy(this.`relayUrl`)
-
+    
         Disposable.destroy(this.`addrs`)
-
+    
         Disposable.destroy(this.`connType`)
-
+    
         Disposable.destroy(this.`latency`)
-
+    
         Disposable.destroy(this.`lastUsed`)
+    
     }
-
+    
     companion object
 }
 
-public object FfiConverterTypeConnectionInfo : FfiConverterRustBuffer<ConnectionInfo> {
-    override fun read(buf: ByteBuffer): ConnectionInfo =
-        ConnectionInfo(
+public object FfiConverterTypeConnectionInfo: FfiConverterRustBuffer<ConnectionInfo> {
+    override fun read(buf: ByteBuffer): ConnectionInfo {
+        return ConnectionInfo(
             FfiConverterTypePublicKey.read(buf),
             FfiConverterOptionalString.read(buf),
             FfiConverterSequenceTypeDirectAddrInfo.read(buf),
@@ -14622,1394 +13964,1406 @@ public object FfiConverterTypeConnectionInfo : FfiConverterRustBuffer<Connection
             FfiConverterOptionalDuration.read(buf),
             FfiConverterOptionalDuration.read(buf),
         )
+    }
 
-    override fun allocationSize(value: ConnectionInfo) =
-        (
+    override fun allocationSize(value: ConnectionInfo) = (
             FfiConverterTypePublicKey.allocationSize(value.`nodeId`) +
-                FfiConverterOptionalString.allocationSize(value.`relayUrl`) +
-                FfiConverterSequenceTypeDirectAddrInfo.allocationSize(value.`addrs`) +
-                FfiConverterTypeConnectionType.allocationSize(value.`connType`) +
-                FfiConverterOptionalDuration.allocationSize(value.`latency`) +
-                FfiConverterOptionalDuration.allocationSize(value.`lastUsed`)
-        )
+            FfiConverterOptionalString.allocationSize(value.`relayUrl`) +
+            FfiConverterSequenceTypeDirectAddrInfo.allocationSize(value.`addrs`) +
+            FfiConverterTypeConnectionType.allocationSize(value.`connType`) +
+            FfiConverterOptionalDuration.allocationSize(value.`latency`) +
+            FfiConverterOptionalDuration.allocationSize(value.`lastUsed`)
+    )
 
-    override fun write(
-        value: ConnectionInfo,
-        buf: ByteBuffer,
-    ) {
-        FfiConverterTypePublicKey.write(value.`nodeId`, buf)
-        FfiConverterOptionalString.write(value.`relayUrl`, buf)
-        FfiConverterSequenceTypeDirectAddrInfo.write(value.`addrs`, buf)
-        FfiConverterTypeConnectionType.write(value.`connType`, buf)
-        FfiConverterOptionalDuration.write(value.`latency`, buf)
-        FfiConverterOptionalDuration.write(value.`lastUsed`, buf)
+    override fun write(value: ConnectionInfo, buf: ByteBuffer) {
+            FfiConverterTypePublicKey.write(value.`nodeId`, buf)
+            FfiConverterOptionalString.write(value.`relayUrl`, buf)
+            FfiConverterSequenceTypeDirectAddrInfo.write(value.`addrs`, buf)
+            FfiConverterTypeConnectionType.write(value.`connType`, buf)
+            FfiConverterOptionalDuration.write(value.`latency`, buf)
+            FfiConverterOptionalDuration.write(value.`lastUsed`, buf)
     }
 }
+
+
 
 /**
  * The socket address and url id of the mixed connection
  */
-data class ConnectionTypeMixed(
+data class ConnectionTypeMixed (
     /**
      * Address of the node
      */
-    var `addr`: kotlin.String,
+    var `addr`: kotlin.String, 
     /**
      * Url of the relay node to which the node is connected
      */
-    var `relayUrl`: kotlin.String,
+    var `relayUrl`: kotlin.String
 ) {
+    
     companion object
 }
 
-public object FfiConverterTypeConnectionTypeMixed : FfiConverterRustBuffer<ConnectionTypeMixed> {
-    override fun read(buf: ByteBuffer): ConnectionTypeMixed =
-        ConnectionTypeMixed(
+public object FfiConverterTypeConnectionTypeMixed: FfiConverterRustBuffer<ConnectionTypeMixed> {
+    override fun read(buf: ByteBuffer): ConnectionTypeMixed {
+        return ConnectionTypeMixed(
             FfiConverterString.read(buf),
             FfiConverterString.read(buf),
         )
+    }
 
-    override fun allocationSize(value: ConnectionTypeMixed) =
-        (
+    override fun allocationSize(value: ConnectionTypeMixed) = (
             FfiConverterString.allocationSize(value.`addr`) +
-                FfiConverterString.allocationSize(value.`relayUrl`)
-        )
+            FfiConverterString.allocationSize(value.`relayUrl`)
+    )
 
-    override fun write(
-        value: ConnectionTypeMixed,
-        buf: ByteBuffer,
-    ) {
-        FfiConverterString.write(value.`addr`, buf)
-        FfiConverterString.write(value.`relayUrl`, buf)
+    override fun write(value: ConnectionTypeMixed, buf: ByteBuffer) {
+            FfiConverterString.write(value.`addr`, buf)
+            FfiConverterString.write(value.`relayUrl`, buf)
     }
 }
+
+
 
 /**
  * Stats counter
  */
-data class CounterStats(
+data class CounterStats (
     /**
      * The counter value
      */
-    var `value`: kotlin.UInt,
+    var `value`: kotlin.UInt, 
     /**
      * The counter description
      */
-    var `description`: kotlin.String,
+    var `description`: kotlin.String
 ) {
+    
     companion object
 }
 
-public object FfiConverterTypeCounterStats : FfiConverterRustBuffer<CounterStats> {
-    override fun read(buf: ByteBuffer): CounterStats =
-        CounterStats(
+public object FfiConverterTypeCounterStats: FfiConverterRustBuffer<CounterStats> {
+    override fun read(buf: ByteBuffer): CounterStats {
+        return CounterStats(
             FfiConverterUInt.read(buf),
             FfiConverterString.read(buf),
         )
+    }
 
-    override fun allocationSize(value: CounterStats) =
-        (
+    override fun allocationSize(value: CounterStats) = (
             FfiConverterUInt.allocationSize(value.`value`) +
-                FfiConverterString.allocationSize(value.`description`)
-        )
+            FfiConverterString.allocationSize(value.`description`)
+    )
 
-    override fun write(
-        value: CounterStats,
-        buf: ByteBuffer,
-    ) {
-        FfiConverterUInt.write(value.`value`, buf)
-        FfiConverterString.write(value.`description`, buf)
+    override fun write(value: CounterStats, buf: ByteBuffer) {
+            FfiConverterUInt.write(value.`value`, buf)
+            FfiConverterString.write(value.`description`, buf)
     }
 }
+
+
 
 /**
  * A DocExportProgress event indicating we got an error and need to abort
  */
-data class DocExportProgressAbort(
+data class DocExportProgressAbort (
     /**
      * The error message
      */
-    var `error`: kotlin.String,
+    var `error`: kotlin.String
 ) {
+    
     companion object
 }
 
-public object FfiConverterTypeDocExportProgressAbort : FfiConverterRustBuffer<DocExportProgressAbort> {
-    override fun read(buf: ByteBuffer): DocExportProgressAbort =
-        DocExportProgressAbort(
+public object FfiConverterTypeDocExportProgressAbort: FfiConverterRustBuffer<DocExportProgressAbort> {
+    override fun read(buf: ByteBuffer): DocExportProgressAbort {
+        return DocExportProgressAbort(
             FfiConverterString.read(buf),
         )
+    }
 
-    override fun allocationSize(value: DocExportProgressAbort) =
-        (
+    override fun allocationSize(value: DocExportProgressAbort) = (
             FfiConverterString.allocationSize(value.`error`)
-        )
+    )
 
-    override fun write(
-        value: DocExportProgressAbort,
-        buf: ByteBuffer,
-    ) {
-        FfiConverterString.write(value.`error`, buf)
+    override fun write(value: DocExportProgressAbort, buf: ByteBuffer) {
+            FfiConverterString.write(value.`error`, buf)
     }
 }
+
+
 
 /**
  * A DocExportProgress event indicating a file was found with name `name`, from now on referred to via `id`
  */
-data class DocExportProgressFound(
+data class DocExportProgressFound (
     /**
      * A new unique id for this entry.
      */
-    var `id`: kotlin.ULong,
+    var `id`: kotlin.ULong, 
     /**
      * The hash of the entry.
      */
-    var `hash`: Hash,
+    var `hash`: Hash, 
     /**
      * The size of the entry in bytes.
      */
-    var `size`: kotlin.ULong,
+    var `size`: kotlin.ULong, 
     /**
      * The path where we are writing the entry
      */
-    var `outpath`: kotlin.String,
+    var `outpath`: kotlin.String
 ) : Disposable {
+    
     @Suppress("UNNECESSARY_SAFE_CALL") // codegen is much simpler if we unconditionally emit safe calls here
     override fun destroy() {
+        
         Disposable.destroy(this.`id`)
-
+    
         Disposable.destroy(this.`hash`)
-
+    
         Disposable.destroy(this.`size`)
-
+    
         Disposable.destroy(this.`outpath`)
+    
     }
-
+    
     companion object
 }
 
-public object FfiConverterTypeDocExportProgressFound : FfiConverterRustBuffer<DocExportProgressFound> {
-    override fun read(buf: ByteBuffer): DocExportProgressFound =
-        DocExportProgressFound(
+public object FfiConverterTypeDocExportProgressFound: FfiConverterRustBuffer<DocExportProgressFound> {
+    override fun read(buf: ByteBuffer): DocExportProgressFound {
+        return DocExportProgressFound(
             FfiConverterULong.read(buf),
             FfiConverterTypeHash.read(buf),
             FfiConverterULong.read(buf),
             FfiConverterString.read(buf),
         )
+    }
 
-    override fun allocationSize(value: DocExportProgressFound) =
-        (
+    override fun allocationSize(value: DocExportProgressFound) = (
             FfiConverterULong.allocationSize(value.`id`) +
-                FfiConverterTypeHash.allocationSize(value.`hash`) +
-                FfiConverterULong.allocationSize(value.`size`) +
-                FfiConverterString.allocationSize(value.`outpath`)
-        )
+            FfiConverterTypeHash.allocationSize(value.`hash`) +
+            FfiConverterULong.allocationSize(value.`size`) +
+            FfiConverterString.allocationSize(value.`outpath`)
+    )
 
-    override fun write(
-        value: DocExportProgressFound,
-        buf: ByteBuffer,
-    ) {
-        FfiConverterULong.write(value.`id`, buf)
-        FfiConverterTypeHash.write(value.`hash`, buf)
-        FfiConverterULong.write(value.`size`, buf)
-        FfiConverterString.write(value.`outpath`, buf)
+    override fun write(value: DocExportProgressFound, buf: ByteBuffer) {
+            FfiConverterULong.write(value.`id`, buf)
+            FfiConverterTypeHash.write(value.`hash`, buf)
+            FfiConverterULong.write(value.`size`, buf)
+            FfiConverterString.write(value.`outpath`, buf)
     }
 }
+
+
 
 /**
  * A DocExportProgress event indicating we've made progress exporting item `id`.
  */
-data class DocExportProgressProgress(
+data class DocExportProgressProgress (
     /**
      * The unique id of the entry.
      */
-    var `id`: kotlin.ULong,
+    var `id`: kotlin.ULong, 
     /**
      * The offset of the progress, in bytes.
      */
-    var `offset`: kotlin.ULong,
+    var `offset`: kotlin.ULong
 ) {
+    
     companion object
 }
 
-public object FfiConverterTypeDocExportProgressProgress : FfiConverterRustBuffer<DocExportProgressProgress> {
-    override fun read(buf: ByteBuffer): DocExportProgressProgress =
-        DocExportProgressProgress(
+public object FfiConverterTypeDocExportProgressProgress: FfiConverterRustBuffer<DocExportProgressProgress> {
+    override fun read(buf: ByteBuffer): DocExportProgressProgress {
+        return DocExportProgressProgress(
             FfiConverterULong.read(buf),
             FfiConverterULong.read(buf),
         )
+    }
 
-    override fun allocationSize(value: DocExportProgressProgress) =
-        (
+    override fun allocationSize(value: DocExportProgressProgress) = (
             FfiConverterULong.allocationSize(value.`id`) +
-                FfiConverterULong.allocationSize(value.`offset`)
-        )
+            FfiConverterULong.allocationSize(value.`offset`)
+    )
 
-    override fun write(
-        value: DocExportProgressProgress,
-        buf: ByteBuffer,
-    ) {
-        FfiConverterULong.write(value.`id`, buf)
-        FfiConverterULong.write(value.`offset`, buf)
+    override fun write(value: DocExportProgressProgress, buf: ByteBuffer) {
+            FfiConverterULong.write(value.`id`, buf)
+            FfiConverterULong.write(value.`offset`, buf)
     }
 }
+
+
 
 /**
  * A DocImportProgress event indicating we got an error and need to abort
  */
-data class DocImportProgressAbort(
+data class DocImportProgressAbort (
     /**
      * The error message
      */
-    var `error`: kotlin.String,
+    var `error`: kotlin.String
 ) {
+    
     companion object
 }
 
-public object FfiConverterTypeDocImportProgressAbort : FfiConverterRustBuffer<DocImportProgressAbort> {
-    override fun read(buf: ByteBuffer): DocImportProgressAbort =
-        DocImportProgressAbort(
+public object FfiConverterTypeDocImportProgressAbort: FfiConverterRustBuffer<DocImportProgressAbort> {
+    override fun read(buf: ByteBuffer): DocImportProgressAbort {
+        return DocImportProgressAbort(
             FfiConverterString.read(buf),
         )
+    }
 
-    override fun allocationSize(value: DocImportProgressAbort) =
-        (
+    override fun allocationSize(value: DocImportProgressAbort) = (
             FfiConverterString.allocationSize(value.`error`)
-        )
+    )
 
-    override fun write(
-        value: DocImportProgressAbort,
-        buf: ByteBuffer,
-    ) {
-        FfiConverterString.write(value.`error`, buf)
+    override fun write(value: DocImportProgressAbort, buf: ByteBuffer) {
+            FfiConverterString.write(value.`error`, buf)
     }
 }
+
+
 
 /**
  * A DocImportProgress event indicating we are done setting the entry to the doc
  */
-data class DocImportProgressAllDone(
+data class DocImportProgressAllDone (
     /**
      * The key of the entry
      */
-    var `key`: kotlin.ByteArray,
+    var `key`: kotlin.ByteArray
 ) {
+    
     companion object
 }
 
-public object FfiConverterTypeDocImportProgressAllDone : FfiConverterRustBuffer<DocImportProgressAllDone> {
-    override fun read(buf: ByteBuffer): DocImportProgressAllDone =
-        DocImportProgressAllDone(
+public object FfiConverterTypeDocImportProgressAllDone: FfiConverterRustBuffer<DocImportProgressAllDone> {
+    override fun read(buf: ByteBuffer): DocImportProgressAllDone {
+        return DocImportProgressAllDone(
             FfiConverterByteArray.read(buf),
         )
+    }
 
-    override fun allocationSize(value: DocImportProgressAllDone) =
-        (
+    override fun allocationSize(value: DocImportProgressAllDone) = (
             FfiConverterByteArray.allocationSize(value.`key`)
-        )
+    )
 
-    override fun write(
-        value: DocImportProgressAllDone,
-        buf: ByteBuffer,
-    ) {
-        FfiConverterByteArray.write(value.`key`, buf)
+    override fun write(value: DocImportProgressAllDone, buf: ByteBuffer) {
+            FfiConverterByteArray.write(value.`key`, buf)
     }
 }
+
+
 
 /**
  * A DocImportProgress event indicating a file was found with name `name`, from now on referred to via `id`
  */
-data class DocImportProgressFound(
+data class DocImportProgressFound (
     /**
      * A new unique id for this entry.
      */
-    var `id`: kotlin.ULong,
+    var `id`: kotlin.ULong, 
     /**
      * The name of the entry.
      */
-    var `name`: kotlin.String,
+    var `name`: kotlin.String, 
     /**
      * The size of the entry in bytes.
      */
-    var `size`: kotlin.ULong,
+    var `size`: kotlin.ULong
 ) {
+    
     companion object
 }
 
-public object FfiConverterTypeDocImportProgressFound : FfiConverterRustBuffer<DocImportProgressFound> {
-    override fun read(buf: ByteBuffer): DocImportProgressFound =
-        DocImportProgressFound(
+public object FfiConverterTypeDocImportProgressFound: FfiConverterRustBuffer<DocImportProgressFound> {
+    override fun read(buf: ByteBuffer): DocImportProgressFound {
+        return DocImportProgressFound(
             FfiConverterULong.read(buf),
             FfiConverterString.read(buf),
             FfiConverterULong.read(buf),
         )
+    }
 
-    override fun allocationSize(value: DocImportProgressFound) =
-        (
+    override fun allocationSize(value: DocImportProgressFound) = (
             FfiConverterULong.allocationSize(value.`id`) +
-                FfiConverterString.allocationSize(value.`name`) +
-                FfiConverterULong.allocationSize(value.`size`)
-        )
+            FfiConverterString.allocationSize(value.`name`) +
+            FfiConverterULong.allocationSize(value.`size`)
+    )
 
-    override fun write(
-        value: DocImportProgressFound,
-        buf: ByteBuffer,
-    ) {
-        FfiConverterULong.write(value.`id`, buf)
-        FfiConverterString.write(value.`name`, buf)
-        FfiConverterULong.write(value.`size`, buf)
+    override fun write(value: DocImportProgressFound, buf: ByteBuffer) {
+            FfiConverterULong.write(value.`id`, buf)
+            FfiConverterString.write(value.`name`, buf)
+            FfiConverterULong.write(value.`size`, buf)
     }
 }
+
+
 
 /**
  * A DocImportProgress event indicating we are finished adding `id` to the data store and the hash is `hash`.
  */
-data class DocImportProgressIngestDone(
+data class DocImportProgressIngestDone (
     /**
      * The unique id of the entry.
      */
-    var `id`: kotlin.ULong,
+    var `id`: kotlin.ULong, 
     /**
      * The hash of the entry.
      */
-    var `hash`: Hash,
+    var `hash`: Hash
 ) : Disposable {
+    
     @Suppress("UNNECESSARY_SAFE_CALL") // codegen is much simpler if we unconditionally emit safe calls here
     override fun destroy() {
+        
         Disposable.destroy(this.`id`)
-
+    
         Disposable.destroy(this.`hash`)
+    
     }
-
+    
     companion object
 }
 
-public object FfiConverterTypeDocImportProgressIngestDone : FfiConverterRustBuffer<DocImportProgressIngestDone> {
-    override fun read(buf: ByteBuffer): DocImportProgressIngestDone =
-        DocImportProgressIngestDone(
+public object FfiConverterTypeDocImportProgressIngestDone: FfiConverterRustBuffer<DocImportProgressIngestDone> {
+    override fun read(buf: ByteBuffer): DocImportProgressIngestDone {
+        return DocImportProgressIngestDone(
             FfiConverterULong.read(buf),
             FfiConverterTypeHash.read(buf),
         )
+    }
 
-    override fun allocationSize(value: DocImportProgressIngestDone) =
-        (
+    override fun allocationSize(value: DocImportProgressIngestDone) = (
             FfiConverterULong.allocationSize(value.`id`) +
-                FfiConverterTypeHash.allocationSize(value.`hash`)
-        )
+            FfiConverterTypeHash.allocationSize(value.`hash`)
+    )
 
-    override fun write(
-        value: DocImportProgressIngestDone,
-        buf: ByteBuffer,
-    ) {
-        FfiConverterULong.write(value.`id`, buf)
-        FfiConverterTypeHash.write(value.`hash`, buf)
+    override fun write(value: DocImportProgressIngestDone, buf: ByteBuffer) {
+            FfiConverterULong.write(value.`id`, buf)
+            FfiConverterTypeHash.write(value.`hash`, buf)
     }
 }
+
+
 
 /**
  * A DocImportProgress event indicating we've made progress ingesting item `id`.
  */
-data class DocImportProgressProgress(
+data class DocImportProgressProgress (
     /**
      * The unique id of the entry.
      */
-    var `id`: kotlin.ULong,
+    var `id`: kotlin.ULong, 
     /**
      * The offset of the progress, in bytes.
      */
-    var `offset`: kotlin.ULong,
+    var `offset`: kotlin.ULong
 ) {
+    
     companion object
 }
 
-public object FfiConverterTypeDocImportProgressProgress : FfiConverterRustBuffer<DocImportProgressProgress> {
-    override fun read(buf: ByteBuffer): DocImportProgressProgress =
-        DocImportProgressProgress(
+public object FfiConverterTypeDocImportProgressProgress: FfiConverterRustBuffer<DocImportProgressProgress> {
+    override fun read(buf: ByteBuffer): DocImportProgressProgress {
+        return DocImportProgressProgress(
             FfiConverterULong.read(buf),
             FfiConverterULong.read(buf),
         )
+    }
 
-    override fun allocationSize(value: DocImportProgressProgress) =
-        (
+    override fun allocationSize(value: DocImportProgressProgress) = (
             FfiConverterULong.allocationSize(value.`id`) +
-                FfiConverterULong.allocationSize(value.`offset`)
-        )
+            FfiConverterULong.allocationSize(value.`offset`)
+    )
 
-    override fun write(
-        value: DocImportProgressProgress,
-        buf: ByteBuffer,
-    ) {
-        FfiConverterULong.write(value.`id`, buf)
-        FfiConverterULong.write(value.`offset`, buf)
+    override fun write(value: DocImportProgressProgress, buf: ByteBuffer) {
+            FfiConverterULong.write(value.`id`, buf)
+            FfiConverterULong.write(value.`offset`, buf)
     }
 }
+
+
 
 /**
  * A DownloadProgress event indicating we got an error and need to abort
  */
-data class DownloadProgressAbort(
+data class DownloadProgressAbort (
     /**
      * The error message
      */
-    var `error`: kotlin.String,
+    var `error`: kotlin.String
 ) {
+    
     companion object
 }
 
-public object FfiConverterTypeDownloadProgressAbort : FfiConverterRustBuffer<DownloadProgressAbort> {
-    override fun read(buf: ByteBuffer): DownloadProgressAbort =
-        DownloadProgressAbort(
+public object FfiConverterTypeDownloadProgressAbort: FfiConverterRustBuffer<DownloadProgressAbort> {
+    override fun read(buf: ByteBuffer): DownloadProgressAbort {
+        return DownloadProgressAbort(
             FfiConverterString.read(buf),
         )
+    }
 
-    override fun allocationSize(value: DownloadProgressAbort) =
-        (
+    override fun allocationSize(value: DownloadProgressAbort) = (
             FfiConverterString.allocationSize(value.`error`)
-        )
+    )
 
-    override fun write(
-        value: DownloadProgressAbort,
-        buf: ByteBuffer,
-    ) {
-        FfiConverterString.write(value.`error`, buf)
+    override fun write(value: DownloadProgressAbort, buf: ByteBuffer) {
+            FfiConverterString.write(value.`error`, buf)
     }
 }
+
+
 
 /**
  * A DownloadProgress event indicating we are done with the whole operation
  */
-data class DownloadProgressAllDone(
+data class DownloadProgressAllDone (
     /**
      * The number of bytes written
      */
-    var `bytesWritten`: kotlin.ULong,
+    var `bytesWritten`: kotlin.ULong, 
     /**
      * The number of bytes read
      */
-    var `bytesRead`: kotlin.ULong,
+    var `bytesRead`: kotlin.ULong, 
     /**
      * The time it took to transfer the data
      */
-    var `elapsed`: java.time.Duration,
+    var `elapsed`: java.time.Duration
 ) {
+    
     companion object
 }
 
-public object FfiConverterTypeDownloadProgressAllDone : FfiConverterRustBuffer<DownloadProgressAllDone> {
-    override fun read(buf: ByteBuffer): DownloadProgressAllDone =
-        DownloadProgressAllDone(
+public object FfiConverterTypeDownloadProgressAllDone: FfiConverterRustBuffer<DownloadProgressAllDone> {
+    override fun read(buf: ByteBuffer): DownloadProgressAllDone {
+        return DownloadProgressAllDone(
             FfiConverterULong.read(buf),
             FfiConverterULong.read(buf),
             FfiConverterDuration.read(buf),
         )
+    }
 
-    override fun allocationSize(value: DownloadProgressAllDone) =
-        (
+    override fun allocationSize(value: DownloadProgressAllDone) = (
             FfiConverterULong.allocationSize(value.`bytesWritten`) +
-                FfiConverterULong.allocationSize(value.`bytesRead`) +
-                FfiConverterDuration.allocationSize(value.`elapsed`)
-        )
+            FfiConverterULong.allocationSize(value.`bytesRead`) +
+            FfiConverterDuration.allocationSize(value.`elapsed`)
+    )
 
-    override fun write(
-        value: DownloadProgressAllDone,
-        buf: ByteBuffer,
-    ) {
-        FfiConverterULong.write(value.`bytesWritten`, buf)
-        FfiConverterULong.write(value.`bytesRead`, buf)
-        FfiConverterDuration.write(value.`elapsed`, buf)
+    override fun write(value: DownloadProgressAllDone, buf: ByteBuffer) {
+            FfiConverterULong.write(value.`bytesWritten`, buf)
+            FfiConverterULong.write(value.`bytesRead`, buf)
+            FfiConverterDuration.write(value.`elapsed`, buf)
     }
 }
+
+
 
 /**
  * A DownloadProgress event indicated we are done with `id`
  */
-data class DownloadProgressDone(
+data class DownloadProgressDone (
     /**
      * The unique id of the entry.
      */
-    var `id`: kotlin.ULong,
+    var `id`: kotlin.ULong
 ) {
+    
     companion object
 }
 
-public object FfiConverterTypeDownloadProgressDone : FfiConverterRustBuffer<DownloadProgressDone> {
-    override fun read(buf: ByteBuffer): DownloadProgressDone =
-        DownloadProgressDone(
+public object FfiConverterTypeDownloadProgressDone: FfiConverterRustBuffer<DownloadProgressDone> {
+    override fun read(buf: ByteBuffer): DownloadProgressDone {
+        return DownloadProgressDone(
             FfiConverterULong.read(buf),
         )
+    }
 
-    override fun allocationSize(value: DownloadProgressDone) =
-        (
+    override fun allocationSize(value: DownloadProgressDone) = (
             FfiConverterULong.allocationSize(value.`id`)
-        )
+    )
 
-    override fun write(
-        value: DownloadProgressDone,
-        buf: ByteBuffer,
-    ) {
-        FfiConverterULong.write(value.`id`, buf)
+    override fun write(value: DownloadProgressDone, buf: ByteBuffer) {
+            FfiConverterULong.write(value.`id`, buf)
     }
 }
+
+
 
 /**
  * A DownloadProgress event indicating an item was found with hash `hash`, that can be referred to by `id`
  */
-data class DownloadProgressFound(
+data class DownloadProgressFound (
     /**
      * A new unique id for this entry.
      */
-    var `id`: kotlin.ULong,
+    var `id`: kotlin.ULong, 
     /**
      * child offset
      */
-    var `child`: kotlin.ULong,
+    var `child`: kotlin.ULong, 
     /**
      * The hash of the entry.
      */
-    var `hash`: Hash,
+    var `hash`: Hash, 
     /**
      * The size of the entry in bytes.
      */
-    var `size`: kotlin.ULong,
+    var `size`: kotlin.ULong
 ) : Disposable {
+    
     @Suppress("UNNECESSARY_SAFE_CALL") // codegen is much simpler if we unconditionally emit safe calls here
     override fun destroy() {
+        
         Disposable.destroy(this.`id`)
-
+    
         Disposable.destroy(this.`child`)
-
+    
         Disposable.destroy(this.`hash`)
-
+    
         Disposable.destroy(this.`size`)
+    
     }
-
+    
     companion object
 }
 
-public object FfiConverterTypeDownloadProgressFound : FfiConverterRustBuffer<DownloadProgressFound> {
-    override fun read(buf: ByteBuffer): DownloadProgressFound =
-        DownloadProgressFound(
+public object FfiConverterTypeDownloadProgressFound: FfiConverterRustBuffer<DownloadProgressFound> {
+    override fun read(buf: ByteBuffer): DownloadProgressFound {
+        return DownloadProgressFound(
             FfiConverterULong.read(buf),
             FfiConverterULong.read(buf),
             FfiConverterTypeHash.read(buf),
             FfiConverterULong.read(buf),
         )
+    }
 
-    override fun allocationSize(value: DownloadProgressFound) =
-        (
+    override fun allocationSize(value: DownloadProgressFound) = (
             FfiConverterULong.allocationSize(value.`id`) +
-                FfiConverterULong.allocationSize(value.`child`) +
-                FfiConverterTypeHash.allocationSize(value.`hash`) +
-                FfiConverterULong.allocationSize(value.`size`)
-        )
+            FfiConverterULong.allocationSize(value.`child`) +
+            FfiConverterTypeHash.allocationSize(value.`hash`) +
+            FfiConverterULong.allocationSize(value.`size`)
+    )
 
-    override fun write(
-        value: DownloadProgressFound,
-        buf: ByteBuffer,
-    ) {
-        FfiConverterULong.write(value.`id`, buf)
-        FfiConverterULong.write(value.`child`, buf)
-        FfiConverterTypeHash.write(value.`hash`, buf)
-        FfiConverterULong.write(value.`size`, buf)
+    override fun write(value: DownloadProgressFound, buf: ByteBuffer) {
+            FfiConverterULong.write(value.`id`, buf)
+            FfiConverterULong.write(value.`child`, buf)
+            FfiConverterTypeHash.write(value.`hash`, buf)
+            FfiConverterULong.write(value.`size`, buf)
     }
 }
+
+
 
 /**
  * A DownloadProgress event indicating an item was found with hash `hash`, that can be referred to by `id`
  */
-data class DownloadProgressFoundHashSeq(
+data class DownloadProgressFoundHashSeq (
     /**
      * Number of children in the collection, if known.
      */
-    var `children`: kotlin.ULong,
+    var `children`: kotlin.ULong, 
     /**
      * The hash of the entry.
      */
-    var `hash`: Hash,
+    var `hash`: Hash
 ) : Disposable {
+    
     @Suppress("UNNECESSARY_SAFE_CALL") // codegen is much simpler if we unconditionally emit safe calls here
     override fun destroy() {
+        
         Disposable.destroy(this.`children`)
-
+    
         Disposable.destroy(this.`hash`)
+    
     }
-
+    
     companion object
 }
 
-public object FfiConverterTypeDownloadProgressFoundHashSeq : FfiConverterRustBuffer<DownloadProgressFoundHashSeq> {
-    override fun read(buf: ByteBuffer): DownloadProgressFoundHashSeq =
-        DownloadProgressFoundHashSeq(
+public object FfiConverterTypeDownloadProgressFoundHashSeq: FfiConverterRustBuffer<DownloadProgressFoundHashSeq> {
+    override fun read(buf: ByteBuffer): DownloadProgressFoundHashSeq {
+        return DownloadProgressFoundHashSeq(
             FfiConverterULong.read(buf),
             FfiConverterTypeHash.read(buf),
         )
+    }
 
-    override fun allocationSize(value: DownloadProgressFoundHashSeq) =
-        (
+    override fun allocationSize(value: DownloadProgressFoundHashSeq) = (
             FfiConverterULong.allocationSize(value.`children`) +
-                FfiConverterTypeHash.allocationSize(value.`hash`)
-        )
+            FfiConverterTypeHash.allocationSize(value.`hash`)
+    )
 
-    override fun write(
-        value: DownloadProgressFoundHashSeq,
-        buf: ByteBuffer,
-    ) {
-        FfiConverterULong.write(value.`children`, buf)
-        FfiConverterTypeHash.write(value.`hash`, buf)
+    override fun write(value: DownloadProgressFoundHashSeq, buf: ByteBuffer) {
+            FfiConverterULong.write(value.`children`, buf)
+            FfiConverterTypeHash.write(value.`hash`, buf)
     }
 }
+
+
 
 /**
  * A DownloadProgress event indicating an entry was found locally
  */
-data class DownloadProgressFoundLocal(
+data class DownloadProgressFoundLocal (
     /**
      * child offset
      */
-    var `child`: kotlin.ULong,
+    var `child`: kotlin.ULong, 
     /**
      * The hash of the entry.
      */
-    var `hash`: Hash,
+    var `hash`: Hash, 
     /**
      * The size of the entry in bytes.
      */
-    var `size`: kotlin.ULong,
+    var `size`: kotlin.ULong, 
     /**
      * The ranges that are available locally.
      */
-    var `validRanges`: RangeSpec,
+    var `validRanges`: RangeSpec
 ) : Disposable {
+    
     @Suppress("UNNECESSARY_SAFE_CALL") // codegen is much simpler if we unconditionally emit safe calls here
     override fun destroy() {
+        
         Disposable.destroy(this.`child`)
-
+    
         Disposable.destroy(this.`hash`)
-
+    
         Disposable.destroy(this.`size`)
-
+    
         Disposable.destroy(this.`validRanges`)
+    
     }
-
+    
     companion object
 }
 
-public object FfiConverterTypeDownloadProgressFoundLocal : FfiConverterRustBuffer<DownloadProgressFoundLocal> {
-    override fun read(buf: ByteBuffer): DownloadProgressFoundLocal =
-        DownloadProgressFoundLocal(
+public object FfiConverterTypeDownloadProgressFoundLocal: FfiConverterRustBuffer<DownloadProgressFoundLocal> {
+    override fun read(buf: ByteBuffer): DownloadProgressFoundLocal {
+        return DownloadProgressFoundLocal(
             FfiConverterULong.read(buf),
             FfiConverterTypeHash.read(buf),
             FfiConverterULong.read(buf),
             FfiConverterTypeRangeSpec.read(buf),
         )
+    }
 
-    override fun allocationSize(value: DownloadProgressFoundLocal) =
-        (
+    override fun allocationSize(value: DownloadProgressFoundLocal) = (
             FfiConverterULong.allocationSize(value.`child`) +
-                FfiConverterTypeHash.allocationSize(value.`hash`) +
-                FfiConverterULong.allocationSize(value.`size`) +
-                FfiConverterTypeRangeSpec.allocationSize(value.`validRanges`)
-        )
+            FfiConverterTypeHash.allocationSize(value.`hash`) +
+            FfiConverterULong.allocationSize(value.`size`) +
+            FfiConverterTypeRangeSpec.allocationSize(value.`validRanges`)
+    )
 
-    override fun write(
-        value: DownloadProgressFoundLocal,
-        buf: ByteBuffer,
-    ) {
-        FfiConverterULong.write(value.`child`, buf)
-        FfiConverterTypeHash.write(value.`hash`, buf)
-        FfiConverterULong.write(value.`size`, buf)
-        FfiConverterTypeRangeSpec.write(value.`validRanges`, buf)
+    override fun write(value: DownloadProgressFoundLocal, buf: ByteBuffer) {
+            FfiConverterULong.write(value.`child`, buf)
+            FfiConverterTypeHash.write(value.`hash`, buf)
+            FfiConverterULong.write(value.`size`, buf)
+            FfiConverterTypeRangeSpec.write(value.`validRanges`, buf)
     }
 }
+
+
 
 /**
  * A DownloadProgress event indicating we got progress ingesting item `id`.
  */
-data class DownloadProgressProgress(
+data class DownloadProgressProgress (
     /**
      * The unique id of the entry.
      */
-    var `id`: kotlin.ULong,
+    var `id`: kotlin.ULong, 
     /**
      * The offset of the progress, in bytes.
      */
-    var `offset`: kotlin.ULong,
+    var `offset`: kotlin.ULong
 ) {
+    
     companion object
 }
 
-public object FfiConverterTypeDownloadProgressProgress : FfiConverterRustBuffer<DownloadProgressProgress> {
-    override fun read(buf: ByteBuffer): DownloadProgressProgress =
-        DownloadProgressProgress(
+public object FfiConverterTypeDownloadProgressProgress: FfiConverterRustBuffer<DownloadProgressProgress> {
+    override fun read(buf: ByteBuffer): DownloadProgressProgress {
+        return DownloadProgressProgress(
             FfiConverterULong.read(buf),
             FfiConverterULong.read(buf),
         )
+    }
 
-    override fun allocationSize(value: DownloadProgressProgress) =
-        (
+    override fun allocationSize(value: DownloadProgressProgress) = (
             FfiConverterULong.allocationSize(value.`id`) +
-                FfiConverterULong.allocationSize(value.`offset`)
-        )
+            FfiConverterULong.allocationSize(value.`offset`)
+    )
 
-    override fun write(
-        value: DownloadProgressProgress,
-        buf: ByteBuffer,
-    ) {
-        FfiConverterULong.write(value.`id`, buf)
-        FfiConverterULong.write(value.`offset`, buf)
+    override fun write(value: DownloadProgressProgress, buf: ByteBuffer) {
+            FfiConverterULong.write(value.`id`, buf)
+            FfiConverterULong.write(value.`offset`, buf)
     }
 }
+
+
 
 /**
  * The Hash and associated tag of a newly created collection
  */
-data class HashAndTag(
+data class HashAndTag (
     /**
      * The hash of the collection
      */
-    var `hash`: Hash,
+    var `hash`: Hash, 
     /**
      * The tag of the collection
      */
-    var `tag`: kotlin.ByteArray,
+    var `tag`: kotlin.ByteArray
 ) : Disposable {
+    
     @Suppress("UNNECESSARY_SAFE_CALL") // codegen is much simpler if we unconditionally emit safe calls here
     override fun destroy() {
+        
         Disposable.destroy(this.`hash`)
-
+    
         Disposable.destroy(this.`tag`)
+    
     }
-
+    
     companion object
 }
 
-public object FfiConverterTypeHashAndTag : FfiConverterRustBuffer<HashAndTag> {
-    override fun read(buf: ByteBuffer): HashAndTag =
-        HashAndTag(
+public object FfiConverterTypeHashAndTag: FfiConverterRustBuffer<HashAndTag> {
+    override fun read(buf: ByteBuffer): HashAndTag {
+        return HashAndTag(
             FfiConverterTypeHash.read(buf),
             FfiConverterByteArray.read(buf),
         )
+    }
 
-    override fun allocationSize(value: HashAndTag) =
-        (
+    override fun allocationSize(value: HashAndTag) = (
             FfiConverterTypeHash.allocationSize(value.`hash`) +
-                FfiConverterByteArray.allocationSize(value.`tag`)
-        )
+            FfiConverterByteArray.allocationSize(value.`tag`)
+    )
 
-    override fun write(
-        value: HashAndTag,
-        buf: ByteBuffer,
-    ) {
-        FfiConverterTypeHash.write(value.`hash`, buf)
-        FfiConverterByteArray.write(value.`tag`, buf)
+    override fun write(value: HashAndTag, buf: ByteBuffer) {
+            FfiConverterTypeHash.write(value.`hash`, buf)
+            FfiConverterByteArray.write(value.`tag`, buf)
     }
 }
+
+
 
 /**
  * A response to a list blobs request
  */
-data class IncompleteBlobInfo(
+data class IncompleteBlobInfo (
     /**
      * The size we got
      */
-    var `size`: kotlin.ULong,
+    var `size`: kotlin.ULong, 
     /**
      * The size we expect
      */
-    var `expectedSize`: kotlin.ULong,
+    var `expectedSize`: kotlin.ULong, 
     /**
      * The hash of the blob
      */
-    var `hash`: Hash,
+    var `hash`: Hash
 ) : Disposable {
+    
     @Suppress("UNNECESSARY_SAFE_CALL") // codegen is much simpler if we unconditionally emit safe calls here
     override fun destroy() {
+        
         Disposable.destroy(this.`size`)
-
+    
         Disposable.destroy(this.`expectedSize`)
-
+    
         Disposable.destroy(this.`hash`)
+    
     }
-
+    
     companion object
 }
 
-public object FfiConverterTypeIncompleteBlobInfo : FfiConverterRustBuffer<IncompleteBlobInfo> {
-    override fun read(buf: ByteBuffer): IncompleteBlobInfo =
-        IncompleteBlobInfo(
+public object FfiConverterTypeIncompleteBlobInfo: FfiConverterRustBuffer<IncompleteBlobInfo> {
+    override fun read(buf: ByteBuffer): IncompleteBlobInfo {
+        return IncompleteBlobInfo(
             FfiConverterULong.read(buf),
             FfiConverterULong.read(buf),
             FfiConverterTypeHash.read(buf),
         )
+    }
 
-    override fun allocationSize(value: IncompleteBlobInfo) =
-        (
+    override fun allocationSize(value: IncompleteBlobInfo) = (
             FfiConverterULong.allocationSize(value.`size`) +
-                FfiConverterULong.allocationSize(value.`expectedSize`) +
-                FfiConverterTypeHash.allocationSize(value.`hash`)
-        )
+            FfiConverterULong.allocationSize(value.`expectedSize`) +
+            FfiConverterTypeHash.allocationSize(value.`hash`)
+    )
 
-    override fun write(
-        value: IncompleteBlobInfo,
-        buf: ByteBuffer,
-    ) {
-        FfiConverterULong.write(value.`size`, buf)
-        FfiConverterULong.write(value.`expectedSize`, buf)
-        FfiConverterTypeHash.write(value.`hash`, buf)
+    override fun write(value: IncompleteBlobInfo, buf: ByteBuffer) {
+            FfiConverterULong.write(value.`size`, buf)
+            FfiConverterULong.write(value.`expectedSize`, buf)
+            FfiConverterTypeHash.write(value.`hash`, buf)
     }
 }
+
+
 
 /**
  * Outcome of an InsertRemove event.
  */
-data class InsertRemoteEvent(
+data class InsertRemoteEvent (
     /**
      * The peer that sent us the entry.
      */
-    var `from`: PublicKey,
+    var `from`: PublicKey, 
     /**
      * The inserted entry.
      */
-    var `entry`: Entry,
+    var `entry`: Entry, 
     /**
      * If the content is available at the local node
      */
-    var `contentStatus`: ContentStatus,
+    var `contentStatus`: ContentStatus
 ) : Disposable {
+    
     @Suppress("UNNECESSARY_SAFE_CALL") // codegen is much simpler if we unconditionally emit safe calls here
     override fun destroy() {
+        
         Disposable.destroy(this.`from`)
-
+    
         Disposable.destroy(this.`entry`)
-
+    
         Disposable.destroy(this.`contentStatus`)
+    
     }
-
+    
     companion object
 }
 
-public object FfiConverterTypeInsertRemoteEvent : FfiConverterRustBuffer<InsertRemoteEvent> {
-    override fun read(buf: ByteBuffer): InsertRemoteEvent =
-        InsertRemoteEvent(
+public object FfiConverterTypeInsertRemoteEvent: FfiConverterRustBuffer<InsertRemoteEvent> {
+    override fun read(buf: ByteBuffer): InsertRemoteEvent {
+        return InsertRemoteEvent(
             FfiConverterTypePublicKey.read(buf),
             FfiConverterTypeEntry.read(buf),
             FfiConverterTypeContentStatus.read(buf),
         )
+    }
 
-    override fun allocationSize(value: InsertRemoteEvent) =
-        (
+    override fun allocationSize(value: InsertRemoteEvent) = (
             FfiConverterTypePublicKey.allocationSize(value.`from`) +
-                FfiConverterTypeEntry.allocationSize(value.`entry`) +
-                FfiConverterTypeContentStatus.allocationSize(value.`contentStatus`)
-        )
+            FfiConverterTypeEntry.allocationSize(value.`entry`) +
+            FfiConverterTypeContentStatus.allocationSize(value.`contentStatus`)
+    )
 
-    override fun write(
-        value: InsertRemoteEvent,
-        buf: ByteBuffer,
-    ) {
-        FfiConverterTypePublicKey.write(value.`from`, buf)
-        FfiConverterTypeEntry.write(value.`entry`, buf)
-        FfiConverterTypeContentStatus.write(value.`contentStatus`, buf)
+    override fun write(value: InsertRemoteEvent, buf: ByteBuffer) {
+            FfiConverterTypePublicKey.write(value.`from`, buf)
+            FfiConverterTypeEntry.write(value.`entry`, buf)
+            FfiConverterTypeContentStatus.write(value.`contentStatus`, buf)
     }
 }
+
+
 
 /**
  * The latency and type of the control message
  */
-data class LatencyAndControlMsg(
+data class LatencyAndControlMsg (
     /**
      * The latency of the control message
      */
-    var `latency`: java.time.Duration,
+    var `latency`: java.time.Duration, 
     /**
      * The type of control message, represented as a string
      */
-    var `controlMsg`: kotlin.String,
+    var `controlMsg`: kotlin.String
 ) {
+    
     companion object
 }
 
-public object FfiConverterTypeLatencyAndControlMsg : FfiConverterRustBuffer<LatencyAndControlMsg> {
-    override fun read(buf: ByteBuffer): LatencyAndControlMsg =
-        LatencyAndControlMsg(
+public object FfiConverterTypeLatencyAndControlMsg: FfiConverterRustBuffer<LatencyAndControlMsg> {
+    override fun read(buf: ByteBuffer): LatencyAndControlMsg {
+        return LatencyAndControlMsg(
             FfiConverterDuration.read(buf),
             FfiConverterString.read(buf),
         )
+    }
 
-    override fun allocationSize(value: LatencyAndControlMsg) =
-        (
+    override fun allocationSize(value: LatencyAndControlMsg) = (
             FfiConverterDuration.allocationSize(value.`latency`) +
-                FfiConverterString.allocationSize(value.`controlMsg`)
-        )
+            FfiConverterString.allocationSize(value.`controlMsg`)
+    )
 
-    override fun write(
-        value: LatencyAndControlMsg,
-        buf: ByteBuffer,
-    ) {
-        FfiConverterDuration.write(value.`latency`, buf)
-        FfiConverterString.write(value.`controlMsg`, buf)
+    override fun write(value: LatencyAndControlMsg, buf: ByteBuffer) {
+            FfiConverterDuration.write(value.`latency`, buf)
+            FfiConverterString.write(value.`controlMsg`, buf)
     }
 }
+
+
 
 /**
  * A `Link` includes a name and a hash for a blob in a collection
  */
-data class LinkAndName(
+data class LinkAndName (
     /**
      * The name associated with this [`Hash`]
      */
-    var `name`: kotlin.String,
+    var `name`: kotlin.String, 
     /**
      * The [`Hash`] of the blob
      */
-    var `link`: Hash,
+    var `link`: Hash
 ) : Disposable {
+    
     @Suppress("UNNECESSARY_SAFE_CALL") // codegen is much simpler if we unconditionally emit safe calls here
     override fun destroy() {
+        
         Disposable.destroy(this.`name`)
-
+    
         Disposable.destroy(this.`link`)
+    
     }
-
+    
     companion object
 }
 
-public object FfiConverterTypeLinkAndName : FfiConverterRustBuffer<LinkAndName> {
-    override fun read(buf: ByteBuffer): LinkAndName =
-        LinkAndName(
+public object FfiConverterTypeLinkAndName: FfiConverterRustBuffer<LinkAndName> {
+    override fun read(buf: ByteBuffer): LinkAndName {
+        return LinkAndName(
             FfiConverterString.read(buf),
             FfiConverterTypeHash.read(buf),
         )
+    }
 
-    override fun allocationSize(value: LinkAndName) =
-        (
+    override fun allocationSize(value: LinkAndName) = (
             FfiConverterString.allocationSize(value.`name`) +
-                FfiConverterTypeHash.allocationSize(value.`link`)
-        )
+            FfiConverterTypeHash.allocationSize(value.`link`)
+    )
 
-    override fun write(
-        value: LinkAndName,
-        buf: ByteBuffer,
-    ) {
-        FfiConverterString.write(value.`name`, buf)
-        FfiConverterTypeHash.write(value.`link`, buf)
+    override fun write(value: LinkAndName, buf: ByteBuffer) {
+            FfiConverterString.write(value.`name`, buf)
+            FfiConverterTypeHash.write(value.`link`, buf)
     }
 }
+
+
 
 /**
  * The namespace id and CapabilityKind (read/write) of the doc
  */
-data class NamespaceAndCapability(
+data class NamespaceAndCapability (
     /**
      * The namespace id of the doc
      */
-    var `namespace`: kotlin.String,
+    var `namespace`: kotlin.String, 
     /**
      * The capability you have for the doc (read/write)
      */
-    var `capability`: CapabilityKind,
+    var `capability`: CapabilityKind
 ) {
+    
     companion object
 }
 
-public object FfiConverterTypeNamespaceAndCapability : FfiConverterRustBuffer<NamespaceAndCapability> {
-    override fun read(buf: ByteBuffer): NamespaceAndCapability =
-        NamespaceAndCapability(
+public object FfiConverterTypeNamespaceAndCapability: FfiConverterRustBuffer<NamespaceAndCapability> {
+    override fun read(buf: ByteBuffer): NamespaceAndCapability {
+        return NamespaceAndCapability(
             FfiConverterString.read(buf),
             FfiConverterTypeCapabilityKind.read(buf),
         )
+    }
 
-    override fun allocationSize(value: NamespaceAndCapability) =
-        (
+    override fun allocationSize(value: NamespaceAndCapability) = (
             FfiConverterString.allocationSize(value.`namespace`) +
-                FfiConverterTypeCapabilityKind.allocationSize(value.`capability`)
-        )
+            FfiConverterTypeCapabilityKind.allocationSize(value.`capability`)
+    )
 
-    override fun write(
-        value: NamespaceAndCapability,
-        buf: ByteBuffer,
-    ) {
-        FfiConverterString.write(value.`namespace`, buf)
-        FfiConverterTypeCapabilityKind.write(value.`capability`, buf)
+    override fun write(value: NamespaceAndCapability, buf: ByteBuffer) {
+            FfiConverterString.write(value.`namespace`, buf)
+            FfiConverterTypeCapabilityKind.write(value.`capability`, buf)
     }
 }
+
+
 
 /**
  * Options passed to [`IrohNode.new`]. Controls the behaviour of an iroh node.
  */
-data class NodeOptions(
+data class NodeOptions (
     /**
      * How frequently the blob store should clean up unreferenced blobs, in milliseconds.
      * Set to 0 to disable gc
      */
-    var `gcIntervalMillis`: kotlin.ULong?,
+    var `gcIntervalMillis`: kotlin.ULong?
 ) {
+    
     companion object
 }
 
-public object FfiConverterTypeNodeOptions : FfiConverterRustBuffer<NodeOptions> {
-    override fun read(buf: ByteBuffer): NodeOptions =
-        NodeOptions(
+public object FfiConverterTypeNodeOptions: FfiConverterRustBuffer<NodeOptions> {
+    override fun read(buf: ByteBuffer): NodeOptions {
+        return NodeOptions(
             FfiConverterOptionalULong.read(buf),
         )
+    }
 
-    override fun allocationSize(value: NodeOptions) =
-        (
+    override fun allocationSize(value: NodeOptions) = (
             FfiConverterOptionalULong.allocationSize(value.`gcIntervalMillis`)
-        )
+    )
 
-    override fun write(
-        value: NodeOptions,
-        buf: ByteBuffer,
-    ) {
-        FfiConverterOptionalULong.write(value.`gcIntervalMillis`, buf)
+    override fun write(value: NodeOptions, buf: ByteBuffer) {
+            FfiConverterOptionalULong.write(value.`gcIntervalMillis`, buf)
     }
 }
+
+
 
 /**
  * The state for an open replica.
  */
-data class OpenState(
+data class OpenState (
     /**
      * Whether to accept sync requests for this replica.
      */
-    var `sync`: kotlin.Boolean,
+    var `sync`: kotlin.Boolean, 
     /**
      * How many event subscriptions are open
      */
-    var `subscribers`: kotlin.ULong,
+    var `subscribers`: kotlin.ULong, 
     /**
      * By how many handles the replica is currently held open
      */
-    var `handles`: kotlin.ULong,
+    var `handles`: kotlin.ULong
 ) {
+    
     companion object
 }
 
-public object FfiConverterTypeOpenState : FfiConverterRustBuffer<OpenState> {
-    override fun read(buf: ByteBuffer): OpenState =
-        OpenState(
+public object FfiConverterTypeOpenState: FfiConverterRustBuffer<OpenState> {
+    override fun read(buf: ByteBuffer): OpenState {
+        return OpenState(
             FfiConverterBoolean.read(buf),
             FfiConverterULong.read(buf),
             FfiConverterULong.read(buf),
         )
+    }
 
-    override fun allocationSize(value: OpenState) =
-        (
+    override fun allocationSize(value: OpenState) = (
             FfiConverterBoolean.allocationSize(value.`sync`) +
-                FfiConverterULong.allocationSize(value.`subscribers`) +
-                FfiConverterULong.allocationSize(value.`handles`)
-        )
+            FfiConverterULong.allocationSize(value.`subscribers`) +
+            FfiConverterULong.allocationSize(value.`handles`)
+    )
 
-    override fun write(
-        value: OpenState,
-        buf: ByteBuffer,
-    ) {
-        FfiConverterBoolean.write(value.`sync`, buf)
-        FfiConverterULong.write(value.`subscribers`, buf)
-        FfiConverterULong.write(value.`handles`, buf)
+    override fun write(value: OpenState, buf: ByteBuffer) {
+            FfiConverterBoolean.write(value.`sync`, buf)
+            FfiConverterULong.write(value.`subscribers`, buf)
+            FfiConverterULong.write(value.`handles`, buf)
     }
 }
+
+
 
 /**
  * Options for sorting and pagination for using [`Query`]s.
  */
-data class QueryOptions(
+data class QueryOptions (
     /**
      * Sort by author or key first.
      *
      * Default is [`SortBy::AuthorKey`], so sorting first by author and then by key.
      */
-    var `sortBy`: SortBy,
+    var `sortBy`: SortBy, 
     /**
      * Direction by which to sort the entries
      *
      * Default is [`SortDirection::Asc`]
      */
-    var `direction`: SortDirection,
+    var `direction`: SortDirection, 
     /**
      * Offset
      */
-    var `offset`: kotlin.ULong,
+    var `offset`: kotlin.ULong, 
     /**
      * Limit to limit the pagination.
      *
      * When the limit is 0, the limit does not exist.
      */
-    var `limit`: kotlin.ULong,
+    var `limit`: kotlin.ULong
 ) {
+    
     companion object
 }
 
-public object FfiConverterTypeQueryOptions : FfiConverterRustBuffer<QueryOptions> {
-    override fun read(buf: ByteBuffer): QueryOptions =
-        QueryOptions(
+public object FfiConverterTypeQueryOptions: FfiConverterRustBuffer<QueryOptions> {
+    override fun read(buf: ByteBuffer): QueryOptions {
+        return QueryOptions(
             FfiConverterTypeSortBy.read(buf),
             FfiConverterTypeSortDirection.read(buf),
             FfiConverterULong.read(buf),
             FfiConverterULong.read(buf),
         )
+    }
 
-    override fun allocationSize(value: QueryOptions) =
-        (
+    override fun allocationSize(value: QueryOptions) = (
             FfiConverterTypeSortBy.allocationSize(value.`sortBy`) +
-                FfiConverterTypeSortDirection.allocationSize(value.`direction`) +
-                FfiConverterULong.allocationSize(value.`offset`) +
-                FfiConverterULong.allocationSize(value.`limit`)
-        )
+            FfiConverterTypeSortDirection.allocationSize(value.`direction`) +
+            FfiConverterULong.allocationSize(value.`offset`) +
+            FfiConverterULong.allocationSize(value.`limit`)
+    )
 
-    override fun write(
-        value: QueryOptions,
-        buf: ByteBuffer,
-    ) {
-        FfiConverterTypeSortBy.write(value.`sortBy`, buf)
-        FfiConverterTypeSortDirection.write(value.`direction`, buf)
-        FfiConverterULong.write(value.`offset`, buf)
-        FfiConverterULong.write(value.`limit`, buf)
+    override fun write(value: QueryOptions, buf: ByteBuffer) {
+            FfiConverterTypeSortBy.write(value.`sortBy`, buf)
+            FfiConverterTypeSortDirection.write(value.`direction`, buf)
+            FfiConverterULong.write(value.`offset`, buf)
+            FfiConverterULong.write(value.`limit`, buf)
     }
 }
+
+
 
 /**
  * Outcome of a sync operation
  */
-data class SyncEvent(
+data class SyncEvent (
     /**
      * Peer we synced with
      */
-    var `peer`: PublicKey,
+    var `peer`: PublicKey, 
     /**
      * Origin of the sync exchange
      */
-    var `origin`: Origin,
+    var `origin`: Origin, 
     /**
      * Timestamp when the sync finished
      */
-    var `started`: java.time.Instant,
+    var `started`: java.time.Instant, 
     /**
      * Timestamp when the sync started
      */
-    var `finished`: java.time.Instant,
+    var `finished`: java.time.Instant, 
     /**
      * Result of the sync operation. `None` if successfull.
      */
-    var `result`: kotlin.String?,
+    var `result`: kotlin.String?
 ) : Disposable {
+    
     @Suppress("UNNECESSARY_SAFE_CALL") // codegen is much simpler if we unconditionally emit safe calls here
     override fun destroy() {
+        
         Disposable.destroy(this.`peer`)
-
+    
         Disposable.destroy(this.`origin`)
-
+    
         Disposable.destroy(this.`started`)
-
+    
         Disposable.destroy(this.`finished`)
-
+    
         Disposable.destroy(this.`result`)
+    
     }
-
+    
     companion object
 }
 
-public object FfiConverterTypeSyncEvent : FfiConverterRustBuffer<SyncEvent> {
-    override fun read(buf: ByteBuffer): SyncEvent =
-        SyncEvent(
+public object FfiConverterTypeSyncEvent: FfiConverterRustBuffer<SyncEvent> {
+    override fun read(buf: ByteBuffer): SyncEvent {
+        return SyncEvent(
             FfiConverterTypePublicKey.read(buf),
             FfiConverterTypeOrigin.read(buf),
             FfiConverterTimestamp.read(buf),
             FfiConverterTimestamp.read(buf),
             FfiConverterOptionalString.read(buf),
         )
+    }
 
-    override fun allocationSize(value: SyncEvent) =
-        (
+    override fun allocationSize(value: SyncEvent) = (
             FfiConverterTypePublicKey.allocationSize(value.`peer`) +
-                FfiConverterTypeOrigin.allocationSize(value.`origin`) +
-                FfiConverterTimestamp.allocationSize(value.`started`) +
-                FfiConverterTimestamp.allocationSize(value.`finished`) +
-                FfiConverterOptionalString.allocationSize(value.`result`)
-        )
+            FfiConverterTypeOrigin.allocationSize(value.`origin`) +
+            FfiConverterTimestamp.allocationSize(value.`started`) +
+            FfiConverterTimestamp.allocationSize(value.`finished`) +
+            FfiConverterOptionalString.allocationSize(value.`result`)
+    )
 
-    override fun write(
-        value: SyncEvent,
-        buf: ByteBuffer,
-    ) {
-        FfiConverterTypePublicKey.write(value.`peer`, buf)
-        FfiConverterTypeOrigin.write(value.`origin`, buf)
-        FfiConverterTimestamp.write(value.`started`, buf)
-        FfiConverterTimestamp.write(value.`finished`, buf)
-        FfiConverterOptionalString.write(value.`result`, buf)
+    override fun write(value: SyncEvent, buf: ByteBuffer) {
+            FfiConverterTypePublicKey.write(value.`peer`, buf)
+            FfiConverterTypeOrigin.write(value.`origin`, buf)
+            FfiConverterTimestamp.write(value.`started`, buf)
+            FfiConverterTimestamp.write(value.`finished`, buf)
+            FfiConverterOptionalString.write(value.`result`, buf)
     }
 }
+
+
 
 /**
  * A response to a list collections request
  */
-data class TagInfo(
+data class TagInfo (
     /**
      * The tag
      */
-    var `name`: kotlin.ByteArray,
+    var `name`: kotlin.ByteArray, 
     /**
      * The format of the associated blob
      */
-    var `format`: BlobFormat,
+    var `format`: BlobFormat, 
     /**
      * The hash of the associated blob
      */
-    var `hash`: Hash,
+    var `hash`: Hash
 ) : Disposable {
+    
     @Suppress("UNNECESSARY_SAFE_CALL") // codegen is much simpler if we unconditionally emit safe calls here
     override fun destroy() {
+        
         Disposable.destroy(this.`name`)
-
+    
         Disposable.destroy(this.`format`)
-
+    
         Disposable.destroy(this.`hash`)
+    
     }
-
+    
     companion object
 }
 
-public object FfiConverterTypeTagInfo : FfiConverterRustBuffer<TagInfo> {
-    override fun read(buf: ByteBuffer): TagInfo =
-        TagInfo(
+public object FfiConverterTypeTagInfo: FfiConverterRustBuffer<TagInfo> {
+    override fun read(buf: ByteBuffer): TagInfo {
+        return TagInfo(
             FfiConverterByteArray.read(buf),
             FfiConverterTypeBlobFormat.read(buf),
             FfiConverterTypeHash.read(buf),
         )
+    }
 
-    override fun allocationSize(value: TagInfo) =
-        (
+    override fun allocationSize(value: TagInfo) = (
             FfiConverterByteArray.allocationSize(value.`name`) +
-                FfiConverterTypeBlobFormat.allocationSize(value.`format`) +
-                FfiConverterTypeHash.allocationSize(value.`hash`)
-        )
+            FfiConverterTypeBlobFormat.allocationSize(value.`format`) +
+            FfiConverterTypeHash.allocationSize(value.`hash`)
+    )
 
-    override fun write(
-        value: TagInfo,
-        buf: ByteBuffer,
-    ) {
-        FfiConverterByteArray.write(value.`name`, buf)
-        FfiConverterTypeBlobFormat.write(value.`format`, buf)
-        FfiConverterTypeHash.write(value.`hash`, buf)
+    override fun write(value: TagInfo, buf: ByteBuffer) {
+            FfiConverterByteArray.write(value.`name`, buf)
+            FfiConverterTypeBlobFormat.write(value.`format`, buf)
+            FfiConverterTypeHash.write(value.`hash`, buf)
     }
 }
+
+
 
 /**
  * The different types of AddProgress events
  */
 
 enum class AddProgressType {
+    
     /**
      * An item was found with name `name`, from now on referred to via `id`
      */
     FOUND,
-
     /**
      * We got progress ingesting item `id`.
      */
     PROGRESS,
-
     /**
      * We are done with `id`, and the hash is `hash`.
      */
     DONE,
-
     /**
      * We are done with the whole operation.
      */
     ALL_DONE,
-
     /**
      * We got an error and need to abort.
      *
      * This will be the last message in the stream.
      */
-    ABORT,
-
-    ;
-
+    ABORT;
     companion object
 }
 
-public object FfiConverterTypeAddProgressType : FfiConverterRustBuffer<AddProgressType> {
-    override fun read(buf: ByteBuffer) =
-        try {
-            AddProgressType.values()[buf.getInt() - 1]
-        } catch (e: IndexOutOfBoundsException) {
-            throw RuntimeException("invalid enum value, something is very wrong!!", e)
-        }
+
+public object FfiConverterTypeAddProgressType: FfiConverterRustBuffer<AddProgressType> {
+    override fun read(buf: ByteBuffer) = try {
+        AddProgressType.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
 
     override fun allocationSize(value: AddProgressType) = 4UL
 
-    override fun write(
-        value: AddProgressType,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: AddProgressType, buf: ByteBuffer) {
         buf.putInt(value.ordinal + 1)
     }
 }
+
+
+
+
 
 /**
  * Options when creating a ticket
  */
 
 enum class AddrInfoOptions {
+    
     /**
      * Only the Node ID is added.
      *
      * This usually means that iroh-dns discovery is used to find address information.
      */
     ID,
-
     /**
      * Include both the relay URL and the direct addresses.
      */
     RELAY_AND_ADDRESSES,
-
     /**
      * Only include the relay URL.
      */
     RELAY,
-
     /**
      * Only include the direct addresses.
      */
-    ADDRESSES,
-
-    ;
-
+    ADDRESSES;
     companion object
 }
 
-public object FfiConverterTypeAddrInfoOptions : FfiConverterRustBuffer<AddrInfoOptions> {
-    override fun read(buf: ByteBuffer) =
-        try {
-            AddrInfoOptions.values()[buf.getInt() - 1]
-        } catch (e: IndexOutOfBoundsException) {
-            throw RuntimeException("invalid enum value, something is very wrong!!", e)
-        }
+
+public object FfiConverterTypeAddrInfoOptions: FfiConverterRustBuffer<AddrInfoOptions> {
+    override fun read(buf: ByteBuffer) = try {
+        AddrInfoOptions.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
 
     override fun allocationSize(value: AddrInfoOptions) = 4UL
 
-    override fun write(
-        value: AddrInfoOptions,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: AddrInfoOptions, buf: ByteBuffer) {
         buf.putInt(value.ordinal + 1)
     }
 }
+
+
+
+
 
 /**
  * The expected format of a hash being exported.
  */
 
 enum class BlobExportFormat {
+    
     /**
      * The hash refers to any blob and will be exported to a single file.
      */
     BLOB,
-
     /**
      * The hash refers to a [`crate::format::collection::Collection`] blob
      * and all children of the collection shall be exported to one file per child.
@@ -16021,30 +15375,28 @@ enum class BlobExportFormat {
      *
      * If the blob cannot be parsed as a collection, the operation will fail.
      */
-    COLLECTION,
-
-    ;
-
+    COLLECTION;
     companion object
 }
 
-public object FfiConverterTypeBlobExportFormat : FfiConverterRustBuffer<BlobExportFormat> {
-    override fun read(buf: ByteBuffer) =
-        try {
-            BlobExportFormat.values()[buf.getInt() - 1]
-        } catch (e: IndexOutOfBoundsException) {
-            throw RuntimeException("invalid enum value, something is very wrong!!", e)
-        }
+
+public object FfiConverterTypeBlobExportFormat: FfiConverterRustBuffer<BlobExportFormat> {
+    override fun read(buf: ByteBuffer) = try {
+        BlobExportFormat.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
 
     override fun allocationSize(value: BlobExportFormat) = 4UL
 
-    override fun write(
-        value: BlobExportFormat,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: BlobExportFormat, buf: ByteBuffer) {
         buf.putInt(value.ordinal + 1)
     }
 }
+
+
+
+
 
 /**
  * The export mode describes how files will be exported.
@@ -16056,6 +15408,7 @@ public object FfiConverterTypeBlobExportFormat : FfiConverterRustBuffer<BlobExpo
  */
 
 enum class BlobExportMode {
+    
     /**
      * This mode will copy the file to the target directory.
      *
@@ -16063,7 +15416,6 @@ enum class BlobExportMode {
      * after it has been exported.
      */
     COPY,
-
     /**
      * This mode will try to move the file to the target directory and then reference it from
      * the database.
@@ -16074,75 +15426,71 @@ enum class BlobExportMode {
      * Stores are allowed to ignore this mode and always copy the file, e.g.
      * if the file is very small or if the store does not support referencing files.
      */
-    TRY_REFERENCE,
-
-    ;
-
+    TRY_REFERENCE;
     companion object
 }
 
-public object FfiConverterTypeBlobExportMode : FfiConverterRustBuffer<BlobExportMode> {
-    override fun read(buf: ByteBuffer) =
-        try {
-            BlobExportMode.values()[buf.getInt() - 1]
-        } catch (e: IndexOutOfBoundsException) {
-            throw RuntimeException("invalid enum value, something is very wrong!!", e)
-        }
+
+public object FfiConverterTypeBlobExportMode: FfiConverterRustBuffer<BlobExportMode> {
+    override fun read(buf: ByteBuffer) = try {
+        BlobExportMode.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
 
     override fun allocationSize(value: BlobExportMode) = 4UL
 
-    override fun write(
-        value: BlobExportMode,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: BlobExportMode, buf: ByteBuffer) {
         buf.putInt(value.ordinal + 1)
     }
 }
+
+
+
+
 
 /**
  * A format identifier
  */
 
 enum class BlobFormat {
+    
     /**
      * Raw blob
      */
     RAW,
-
     /**
      * A sequence of BLAKE3 hashes
      */
-    HASH_SEQ,
-
-    ;
-
+    HASH_SEQ;
     companion object
 }
 
-public object FfiConverterTypeBlobFormat : FfiConverterRustBuffer<BlobFormat> {
-    override fun read(buf: ByteBuffer) =
-        try {
-            BlobFormat.values()[buf.getInt() - 1]
-        } catch (e: IndexOutOfBoundsException) {
-            throw RuntimeException("invalid enum value, something is very wrong!!", e)
-        }
+
+public object FfiConverterTypeBlobFormat: FfiConverterRustBuffer<BlobFormat> {
+    override fun read(buf: ByteBuffer) = try {
+        BlobFormat.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
 
     override fun allocationSize(value: BlobFormat) = 4UL
 
-    override fun write(
-        value: BlobFormat,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: BlobFormat, buf: ByteBuffer) {
         buf.putInt(value.ordinal + 1)
     }
 }
 
-sealed class CallbackException(
-    message: String,
-) : kotlin.Exception(message) {
-    class Exception(
-        message: String,
-    ) : CallbackException(message)
+
+
+
+
+
+
+sealed class CallbackException(message: String): kotlin.Exception(message) {
+        
+        class Exception(message: String) : CallbackException(message)
+        
 
     companion object ErrorHandler : UniffiRustCallStatusErrorHandler<CallbackException> {
         override fun lift(error_buf: RustBuffer.ByValue): CallbackException = FfiConverterTypeCallbackError.lift(error_buf)
@@ -16150,376 +15498,348 @@ sealed class CallbackException(
 }
 
 public object FfiConverterTypeCallbackError : FfiConverterRustBuffer<CallbackException> {
-    override fun read(buf: ByteBuffer): CallbackException =
-        when (buf.getInt()) {
+    override fun read(buf: ByteBuffer): CallbackException {
+        
+            return when(buf.getInt()) {
             1 -> CallbackException.Exception(FfiConverterString.read(buf))
             else -> throw RuntimeException("invalid error enum value, something is very wrong!!")
         }
+        
+    }
 
-    override fun allocationSize(value: CallbackException): ULong = 4UL
+    override fun allocationSize(value: CallbackException): ULong {
+        return 4UL
+    }
 
-    override fun write(
-        value: CallbackException,
-        buf: ByteBuffer,
-    ) {
-        when (value) {
+    override fun write(value: CallbackException, buf: ByteBuffer) {
+        when(value) {
             is CallbackException.Exception -> {
                 buf.putInt(1)
                 Unit
             }
         }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }
     }
+
 }
+
+
 
 /**
  * Kind of capability of the doc.
  */
 
 enum class CapabilityKind {
+    
     /**
      * A writable doc
      */
     WRITE,
-
     /**
      * A readable doc
      */
-    READ,
-
-    ;
-
+    READ;
     companion object
 }
 
-public object FfiConverterTypeCapabilityKind : FfiConverterRustBuffer<CapabilityKind> {
-    override fun read(buf: ByteBuffer) =
-        try {
-            CapabilityKind.values()[buf.getInt() - 1]
-        } catch (e: IndexOutOfBoundsException) {
-            throw RuntimeException("invalid enum value, something is very wrong!!", e)
-        }
+
+public object FfiConverterTypeCapabilityKind: FfiConverterRustBuffer<CapabilityKind> {
+    override fun read(buf: ByteBuffer) = try {
+        CapabilityKind.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
 
     override fun allocationSize(value: CapabilityKind) = 4UL
 
-    override fun write(
-        value: CapabilityKind,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: CapabilityKind, buf: ByteBuffer) {
         buf.putInt(value.ordinal + 1)
     }
 }
+
+
+
+
 
 /**
  * The type of the connection
  */
 
 enum class ConnType {
+    
     /**
      * Indicates you have a UDP connection.
      */
     DIRECT,
-
     /**
      * Indicates you have a relayed connection.
      */
     RELAY,
-
     /**
      * Indicates you have an unverified UDP connection, and a relay connection for backup.
      */
     MIXED,
-
     /**
      * Indicates you have no proof of connection.
      */
-    NONE,
-
-    ;
-
+    NONE;
     companion object
 }
 
-public object FfiConverterTypeConnType : FfiConverterRustBuffer<ConnType> {
-    override fun read(buf: ByteBuffer) =
-        try {
-            ConnType.values()[buf.getInt() - 1]
-        } catch (e: IndexOutOfBoundsException) {
-            throw RuntimeException("invalid enum value, something is very wrong!!", e)
-        }
+
+public object FfiConverterTypeConnType: FfiConverterRustBuffer<ConnType> {
+    override fun read(buf: ByteBuffer) = try {
+        ConnType.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
 
     override fun allocationSize(value: ConnType) = 4UL
 
-    override fun write(
-        value: ConnType,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: ConnType, buf: ByteBuffer) {
         buf.putInt(value.ordinal + 1)
     }
 }
+
+
+
+
 
 /**
  * Whether the content status is available on a node.
  */
 
 enum class ContentStatus {
+    
     /**
      * The content is completely available.
      */
     COMPLETE,
-
     /**
      * The content is partially available.
      */
     INCOMPLETE,
-
     /**
      * The content is missing.
      */
-    MISSING,
-
-    ;
-
+    MISSING;
     companion object
 }
 
-public object FfiConverterTypeContentStatus : FfiConverterRustBuffer<ContentStatus> {
-    override fun read(buf: ByteBuffer) =
-        try {
-            ContentStatus.values()[buf.getInt() - 1]
-        } catch (e: IndexOutOfBoundsException) {
-            throw RuntimeException("invalid enum value, something is very wrong!!", e)
-        }
+
+public object FfiConverterTypeContentStatus: FfiConverterRustBuffer<ContentStatus> {
+    override fun read(buf: ByteBuffer) = try {
+        ContentStatus.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
 
     override fun allocationSize(value: ContentStatus) = 4UL
 
-    override fun write(
-        value: ContentStatus,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: ContentStatus, buf: ByteBuffer) {
         buf.putInt(value.ordinal + 1)
     }
 }
+
+
+
+
 
 /**
  * The type of `DocExportProgress` event
  */
 
 enum class DocExportProgressType {
+    
     /**
      * An item was found with name `name`, from now on referred to via `id`
      */
     FOUND,
-
     /**
      * We got progress exporting item `id`.
      */
     PROGRESS,
-
     /**
      * We are finished writing item `id`.
      */
     DONE,
-
     /**
      * We are done writing the entry to the filesystem
      */
     ALL_DONE,
-
     /**
      * We got an error and need to abort.
      *
      * This will be the last message in the stream.
      */
-    ABORT,
-
-    ;
-
+    ABORT;
     companion object
 }
 
-public object FfiConverterTypeDocExportProgressType : FfiConverterRustBuffer<DocExportProgressType> {
-    override fun read(buf: ByteBuffer) =
-        try {
-            DocExportProgressType.values()[buf.getInt() - 1]
-        } catch (e: IndexOutOfBoundsException) {
-            throw RuntimeException("invalid enum value, something is very wrong!!", e)
-        }
+
+public object FfiConverterTypeDocExportProgressType: FfiConverterRustBuffer<DocExportProgressType> {
+    override fun read(buf: ByteBuffer) = try {
+        DocExportProgressType.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
 
     override fun allocationSize(value: DocExportProgressType) = 4UL
 
-    override fun write(
-        value: DocExportProgressType,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: DocExportProgressType, buf: ByteBuffer) {
         buf.putInt(value.ordinal + 1)
     }
 }
+
+
+
+
 
 /**
  * The type of `DocImportProgress` event
  */
 
 enum class DocImportProgressType {
+    
     /**
      * An item was found with name `name`, from now on referred to via `id`
      */
     FOUND,
-
     /**
      * We got progress ingesting item `id`.
      */
     PROGRESS,
-
     /**
      * We are done ingesting `id`, and the hash is `hash`.
      */
     INGEST_DONE,
-
     /**
      * We are done with the whole operation.
      */
     ALL_DONE,
-
     /**
      * We got an error and need to abort.
      *
      * This will be the last message in the stream.
      */
-    ABORT,
-
-    ;
-
+    ABORT;
     companion object
 }
 
-public object FfiConverterTypeDocImportProgressType : FfiConverterRustBuffer<DocImportProgressType> {
-    override fun read(buf: ByteBuffer) =
-        try {
-            DocImportProgressType.values()[buf.getInt() - 1]
-        } catch (e: IndexOutOfBoundsException) {
-            throw RuntimeException("invalid enum value, something is very wrong!!", e)
-        }
+
+public object FfiConverterTypeDocImportProgressType: FfiConverterRustBuffer<DocImportProgressType> {
+    override fun read(buf: ByteBuffer) = try {
+        DocImportProgressType.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
 
     override fun allocationSize(value: DocImportProgressType) = 4UL
 
-    override fun write(
-        value: DocImportProgressType,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: DocImportProgressType, buf: ByteBuffer) {
         buf.putInt(value.ordinal + 1)
     }
 }
+
+
+
+
 
 /**
  * The kinds of progress events that can occur in a `DownloadProgress`
  */
 
 enum class DownloadProgressType {
+    
     /**
      * Initial state if subscribing to a running or queued transfer.
      */
     INITIAL_STATE,
-
     /**
      * Data was found locally
      */
     FOUND_LOCAL,
-
     /**
      * A new connection was established.
      */
     CONNECTED,
-
     /**
      * An item was found with hash `hash`, from now on referred to via `id`
      */
     FOUND,
-
     /**
      * An item was found with hash `hash`, from now on referred to via `id`
      */
     FOUND_HASH_SEQ,
-
     /**
      * We got progress ingesting item `id`.
      */
     PROGRESS,
-
     /**
      * We are done with `id`, and the hash is `hash`.
      */
     DONE,
-
     /**
      * We are done with the whole operation.
      */
     ALL_DONE,
-
     /**
      * We got an error and need to abort.
      *
      * This will be the last message in the stream.
      */
-    ABORT,
-
-    ;
-
+    ABORT;
     companion object
 }
 
-public object FfiConverterTypeDownloadProgressType : FfiConverterRustBuffer<DownloadProgressType> {
-    override fun read(buf: ByteBuffer) =
-        try {
-            DownloadProgressType.values()[buf.getInt() - 1]
-        } catch (e: IndexOutOfBoundsException) {
-            throw RuntimeException("invalid enum value, something is very wrong!!", e)
-        }
+
+public object FfiConverterTypeDownloadProgressType: FfiConverterRustBuffer<DownloadProgressType> {
+    override fun read(buf: ByteBuffer) = try {
+        DownloadProgressType.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
 
     override fun allocationSize(value: DownloadProgressType) = 4UL
 
-    override fun write(
-        value: DownloadProgressType,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: DownloadProgressType, buf: ByteBuffer) {
         buf.putInt(value.ordinal + 1)
     }
 }
+
+
+
+
 
 /**
  * The type of events that can be emitted during the live sync progress
  */
 
 enum class LiveEventType {
+    
     /**
      * A local insertion.
      */
     INSERT_LOCAL,
-
     /**
      * Received a remote insert.
      */
     INSERT_REMOTE,
-
     /**
      * The content of an entry was downloaded and is now available at the local node
      */
     CONTENT_READY,
-
     /**
      * We have a new neighbor in the swarm.
      */
     NEIGHBOR_UP,
-
     /**
      * We lost a neighbor in the swarm.
      */
     NEIGHBOR_DOWN,
-
     /**
      * A set-reconciliation sync finished.
      */
     SYNC_FINISHED,
-
     /**
      * All pending content is now ready.
      *
@@ -16531,119 +15851,116 @@ enum class LiveEventType {
      * Receiving this event does not guarantee that all content in the document is available. If
      * blobs failed to download, this event will still be emitted after all operations completed.
      */
-    PENDING_CONTENT_READY,
-
-    ;
-
+    PENDING_CONTENT_READY;
     companion object
 }
 
-public object FfiConverterTypeLiveEventType : FfiConverterRustBuffer<LiveEventType> {
-    override fun read(buf: ByteBuffer) =
-        try {
-            LiveEventType.values()[buf.getInt() - 1]
-        } catch (e: IndexOutOfBoundsException) {
-            throw RuntimeException("invalid enum value, something is very wrong!!", e)
-        }
+
+public object FfiConverterTypeLiveEventType: FfiConverterRustBuffer<LiveEventType> {
+    override fun read(buf: ByteBuffer) = try {
+        LiveEventType.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
 
     override fun allocationSize(value: LiveEventType) = 4UL
 
-    override fun write(
-        value: LiveEventType,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: LiveEventType, buf: ByteBuffer) {
         buf.putInt(value.ordinal + 1)
     }
 }
+
+
+
+
 
 /**
  * The logging level. See the rust (log crate)[https://docs.rs/log] for more information.
  */
 
 enum class LogLevel {
+    
     TRACE,
     DEBUG,
     INFO,
     WARN,
     ERROR,
-    OFF,
-    ;
-
+    OFF;
     companion object
 }
 
-public object FfiConverterTypeLogLevel : FfiConverterRustBuffer<LogLevel> {
-    override fun read(buf: ByteBuffer) =
-        try {
-            LogLevel.values()[buf.getInt() - 1]
-        } catch (e: IndexOutOfBoundsException) {
-            throw RuntimeException("invalid enum value, something is very wrong!!", e)
-        }
+
+public object FfiConverterTypeLogLevel: FfiConverterRustBuffer<LogLevel> {
+    override fun read(buf: ByteBuffer) = try {
+        LogLevel.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
 
     override fun allocationSize(value: LogLevel) = 4UL
 
-    override fun write(
-        value: LogLevel,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: LogLevel, buf: ByteBuffer) {
         buf.putInt(value.ordinal + 1)
     }
 }
+
+
+
+
 
 /**
  * Why we performed a sync exchange
  */
 sealed class Origin {
+    
     /**
      * public, use a unit variant
      */
     data class Connect(
-        val `reason`: SyncReason,
-    ) : Origin() {
+        val `reason`: SyncReason) : Origin() {
         companion object
     }
-
+    
     /**
      * A peer connected to us and we accepted the exchange
      */
     object Accept : Origin()
+    
+    
 
+    
     companion object
 }
 
-public object FfiConverterTypeOrigin : FfiConverterRustBuffer<Origin> {
-    override fun read(buf: ByteBuffer): Origin =
-        when (buf.getInt()) {
-            1 ->
-                Origin.Connect(
-                    FfiConverterTypeSyncReason.read(buf),
+public object FfiConverterTypeOrigin : FfiConverterRustBuffer<Origin>{
+    override fun read(buf: ByteBuffer): Origin {
+        return when(buf.getInt()) {
+            1 -> Origin.Connect(
+                FfiConverterTypeSyncReason.read(buf),
                 )
             2 -> Origin.Accept
             else -> throw RuntimeException("invalid enum value, something is very wrong!!")
         }
+    }
 
-    override fun allocationSize(value: Origin) =
-        when (value) {
-            is Origin.Connect -> {
-                // Add the size for the Int that specifies the variant plus the size needed for all fields
-                (
-                    4UL +
-                        FfiConverterTypeSyncReason.allocationSize(value.`reason`)
-                )
-            }
-            is Origin.Accept -> {
-                // Add the size for the Int that specifies the variant plus the size needed for all fields
-                (
-                    4UL
-                )
-            }
+    override fun allocationSize(value: Origin) = when(value) {
+        is Origin.Connect -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterTypeSyncReason.allocationSize(value.`reason`)
+            )
         }
+        is Origin.Accept -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+            )
+        }
+    }
 
-    override fun write(
-        value: Origin,
-        buf: ByteBuffer,
-    ) {
-        when (value) {
+    override fun write(value: Origin, buf: ByteBuffer) {
+        when(value) {
             is Origin.Connect -> {
                 buf.putInt(1)
                 FfiConverterTypeSyncReason.write(value.`reason`, buf)
@@ -16657,169 +15974,164 @@ public object FfiConverterTypeOrigin : FfiConverterRustBuffer<Origin> {
     }
 }
 
+
+
+
+
 /**
  * Intended capability for document share tickets
  */
 
 enum class ShareMode {
+    
     /**
      * Read-only access
      */
     READ,
-
     /**
      * Write access
      */
-    WRITE,
-
-    ;
-
+    WRITE;
     companion object
 }
 
-public object FfiConverterTypeShareMode : FfiConverterRustBuffer<ShareMode> {
-    override fun read(buf: ByteBuffer) =
-        try {
-            ShareMode.values()[buf.getInt() - 1]
-        } catch (e: IndexOutOfBoundsException) {
-            throw RuntimeException("invalid enum value, something is very wrong!!", e)
-        }
+
+public object FfiConverterTypeShareMode: FfiConverterRustBuffer<ShareMode> {
+    override fun read(buf: ByteBuffer) = try {
+        ShareMode.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
 
     override fun allocationSize(value: ShareMode) = 4UL
 
-    override fun write(
-        value: ShareMode,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: ShareMode, buf: ByteBuffer) {
         buf.putInt(value.ordinal + 1)
     }
 }
+
+
+
+
 
 /**
  * Fields by which the query can be sorted
  */
 
 enum class SortBy {
+    
     /**
      * Fields by which the query can be sorted
      */
     KEY_AUTHOR,
-
     /**
      * Fields by which the query can be sorted
      */
-    AUTHOR_KEY,
-
-    ;
-
+    AUTHOR_KEY;
     companion object
 }
 
-public object FfiConverterTypeSortBy : FfiConverterRustBuffer<SortBy> {
-    override fun read(buf: ByteBuffer) =
-        try {
-            SortBy.values()[buf.getInt() - 1]
-        } catch (e: IndexOutOfBoundsException) {
-            throw RuntimeException("invalid enum value, something is very wrong!!", e)
-        }
+
+public object FfiConverterTypeSortBy: FfiConverterRustBuffer<SortBy> {
+    override fun read(buf: ByteBuffer) = try {
+        SortBy.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
 
     override fun allocationSize(value: SortBy) = 4UL
 
-    override fun write(
-        value: SortBy,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: SortBy, buf: ByteBuffer) {
         buf.putInt(value.ordinal + 1)
     }
 }
+
+
+
+
 
 /**
  * Sort direction
  */
 
 enum class SortDirection {
+    
     /**
      * Sort ascending
      */
     ASC,
-
     /**
      * Sort descending
      */
-    DESC,
-
-    ;
-
+    DESC;
     companion object
 }
 
-public object FfiConverterTypeSortDirection : FfiConverterRustBuffer<SortDirection> {
-    override fun read(buf: ByteBuffer) =
-        try {
-            SortDirection.values()[buf.getInt() - 1]
-        } catch (e: IndexOutOfBoundsException) {
-            throw RuntimeException("invalid enum value, something is very wrong!!", e)
-        }
+
+public object FfiConverterTypeSortDirection: FfiConverterRustBuffer<SortDirection> {
+    override fun read(buf: ByteBuffer) = try {
+        SortDirection.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
 
     override fun allocationSize(value: SortDirection) = 4UL
 
-    override fun write(
-        value: SortDirection,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: SortDirection, buf: ByteBuffer) {
         buf.putInt(value.ordinal + 1)
     }
 }
+
+
+
+
 
 /**
  * Why we started a sync request
  */
 
 enum class SyncReason {
+    
     /**
      * Direct join request via API
      */
     DIRECT_JOIN,
-
     /**
      * Peer showed up as new neighbor in the gossip swarm
      */
     NEW_NEIGHBOR,
-
     /**
      * We synced after receiving a sync report that indicated news for us
      */
     SYNC_REPORT,
-
     /**
      * We received a sync report while a sync was running, so run again afterwars
      */
-    RESYNC,
-
-    ;
-
+    RESYNC;
     companion object
 }
 
-public object FfiConverterTypeSyncReason : FfiConverterRustBuffer<SyncReason> {
-    override fun read(buf: ByteBuffer) =
-        try {
-            SyncReason.values()[buf.getInt() - 1]
-        } catch (e: IndexOutOfBoundsException) {
-            throw RuntimeException("invalid enum value, something is very wrong!!", e)
-        }
+
+public object FfiConverterTypeSyncReason: FfiConverterRustBuffer<SyncReason> {
+    override fun read(buf: ByteBuffer) = try {
+        SyncReason.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
 
     override fun allocationSize(value: SyncReason) = 4UL
 
-    override fun write(
-        value: SyncReason,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: SyncReason, buf: ByteBuffer) {
         buf.putInt(value.ordinal + 1)
     }
 }
 
-public object FfiConverterOptionalULong : FfiConverterRustBuffer<kotlin.ULong?> {
+
+
+
+
+
+public object FfiConverterOptionalULong: FfiConverterRustBuffer<kotlin.ULong?> {
     override fun read(buf: ByteBuffer): kotlin.ULong? {
         if (buf.get().toInt() == 0) {
             return null
@@ -16835,10 +16147,7 @@ public object FfiConverterOptionalULong : FfiConverterRustBuffer<kotlin.ULong?> 
         }
     }
 
-    override fun write(
-        value: kotlin.ULong?,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: kotlin.ULong?, buf: ByteBuffer) {
         if (value == null) {
             buf.put(0)
         } else {
@@ -16848,7 +16157,10 @@ public object FfiConverterOptionalULong : FfiConverterRustBuffer<kotlin.ULong?> 
     }
 }
 
-public object FfiConverterOptionalString : FfiConverterRustBuffer<kotlin.String?> {
+
+
+
+public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?> {
     override fun read(buf: ByteBuffer): kotlin.String? {
         if (buf.get().toInt() == 0) {
             return null
@@ -16864,10 +16176,7 @@ public object FfiConverterOptionalString : FfiConverterRustBuffer<kotlin.String?
         }
     }
 
-    override fun write(
-        value: kotlin.String?,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: kotlin.String?, buf: ByteBuffer) {
         if (value == null) {
             buf.put(0)
         } else {
@@ -16877,7 +16186,10 @@ public object FfiConverterOptionalString : FfiConverterRustBuffer<kotlin.String?
     }
 }
 
-public object FfiConverterOptionalDuration : FfiConverterRustBuffer<java.time.Duration?> {
+
+
+
+public object FfiConverterOptionalDuration: FfiConverterRustBuffer<java.time.Duration?> {
     override fun read(buf: ByteBuffer): java.time.Duration? {
         if (buf.get().toInt() == 0) {
             return null
@@ -16893,10 +16205,7 @@ public object FfiConverterOptionalDuration : FfiConverterRustBuffer<java.time.Du
         }
     }
 
-    override fun write(
-        value: java.time.Duration?,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: java.time.Duration?, buf: ByteBuffer) {
         if (value == null) {
             buf.put(0)
         } else {
@@ -16906,7 +16215,10 @@ public object FfiConverterOptionalDuration : FfiConverterRustBuffer<java.time.Du
     }
 }
 
-public object FfiConverterOptionalTypeDoc : FfiConverterRustBuffer<Doc?> {
+
+
+
+public object FfiConverterOptionalTypeDoc: FfiConverterRustBuffer<Doc?> {
     override fun read(buf: ByteBuffer): Doc? {
         if (buf.get().toInt() == 0) {
             return null
@@ -16922,10 +16234,7 @@ public object FfiConverterOptionalTypeDoc : FfiConverterRustBuffer<Doc?> {
         }
     }
 
-    override fun write(
-        value: Doc?,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: Doc?, buf: ByteBuffer) {
         if (value == null) {
             buf.put(0)
         } else {
@@ -16935,7 +16244,10 @@ public object FfiConverterOptionalTypeDoc : FfiConverterRustBuffer<Doc?> {
     }
 }
 
-public object FfiConverterOptionalTypeDocExportFileCallback : FfiConverterRustBuffer<DocExportFileCallback?> {
+
+
+
+public object FfiConverterOptionalTypeDocExportFileCallback: FfiConverterRustBuffer<DocExportFileCallback?> {
     override fun read(buf: ByteBuffer): DocExportFileCallback? {
         if (buf.get().toInt() == 0) {
             return null
@@ -16951,10 +16263,7 @@ public object FfiConverterOptionalTypeDocExportFileCallback : FfiConverterRustBu
         }
     }
 
-    override fun write(
-        value: DocExportFileCallback?,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: DocExportFileCallback?, buf: ByteBuffer) {
         if (value == null) {
             buf.put(0)
         } else {
@@ -16964,7 +16273,10 @@ public object FfiConverterOptionalTypeDocExportFileCallback : FfiConverterRustBu
     }
 }
 
-public object FfiConverterOptionalTypeDocImportFileCallback : FfiConverterRustBuffer<DocImportFileCallback?> {
+
+
+
+public object FfiConverterOptionalTypeDocImportFileCallback: FfiConverterRustBuffer<DocImportFileCallback?> {
     override fun read(buf: ByteBuffer): DocImportFileCallback? {
         if (buf.get().toInt() == 0) {
             return null
@@ -16980,10 +16292,7 @@ public object FfiConverterOptionalTypeDocImportFileCallback : FfiConverterRustBu
         }
     }
 
-    override fun write(
-        value: DocImportFileCallback?,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: DocImportFileCallback?, buf: ByteBuffer) {
         if (value == null) {
             buf.put(0)
         } else {
@@ -16993,7 +16302,10 @@ public object FfiConverterOptionalTypeDocImportFileCallback : FfiConverterRustBu
     }
 }
 
-public object FfiConverterOptionalTypeEntry : FfiConverterRustBuffer<Entry?> {
+
+
+
+public object FfiConverterOptionalTypeEntry: FfiConverterRustBuffer<Entry?> {
     override fun read(buf: ByteBuffer): Entry? {
         if (buf.get().toInt() == 0) {
             return null
@@ -17009,10 +16321,7 @@ public object FfiConverterOptionalTypeEntry : FfiConverterRustBuffer<Entry?> {
         }
     }
 
-    override fun write(
-        value: Entry?,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: Entry?, buf: ByteBuffer) {
         if (value == null) {
             buf.put(0)
         } else {
@@ -17022,7 +16331,10 @@ public object FfiConverterOptionalTypeEntry : FfiConverterRustBuffer<Entry?> {
     }
 }
 
-public object FfiConverterOptionalTypeConnectionInfo : FfiConverterRustBuffer<ConnectionInfo?> {
+
+
+
+public object FfiConverterOptionalTypeConnectionInfo: FfiConverterRustBuffer<ConnectionInfo?> {
     override fun read(buf: ByteBuffer): ConnectionInfo? {
         if (buf.get().toInt() == 0) {
             return null
@@ -17038,10 +16350,7 @@ public object FfiConverterOptionalTypeConnectionInfo : FfiConverterRustBuffer<Co
         }
     }
 
-    override fun write(
-        value: ConnectionInfo?,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: ConnectionInfo?, buf: ByteBuffer) {
         if (value == null) {
             buf.put(0)
         } else {
@@ -17051,7 +16360,10 @@ public object FfiConverterOptionalTypeConnectionInfo : FfiConverterRustBuffer<Co
     }
 }
 
-public object FfiConverterOptionalTypeLatencyAndControlMsg : FfiConverterRustBuffer<LatencyAndControlMsg?> {
+
+
+
+public object FfiConverterOptionalTypeLatencyAndControlMsg: FfiConverterRustBuffer<LatencyAndControlMsg?> {
     override fun read(buf: ByteBuffer): LatencyAndControlMsg? {
         if (buf.get().toInt() == 0) {
             return null
@@ -17067,10 +16379,7 @@ public object FfiConverterOptionalTypeLatencyAndControlMsg : FfiConverterRustBuf
         }
     }
 
-    override fun write(
-        value: LatencyAndControlMsg?,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: LatencyAndControlMsg?, buf: ByteBuffer) {
         if (value == null) {
             buf.put(0)
         } else {
@@ -17080,7 +16389,10 @@ public object FfiConverterOptionalTypeLatencyAndControlMsg : FfiConverterRustBuf
     }
 }
 
-public object FfiConverterOptionalTypeQueryOptions : FfiConverterRustBuffer<QueryOptions?> {
+
+
+
+public object FfiConverterOptionalTypeQueryOptions: FfiConverterRustBuffer<QueryOptions?> {
     override fun read(buf: ByteBuffer): QueryOptions? {
         if (buf.get().toInt() == 0) {
             return null
@@ -17096,10 +16408,7 @@ public object FfiConverterOptionalTypeQueryOptions : FfiConverterRustBuffer<Quer
         }
     }
 
-    override fun write(
-        value: QueryOptions?,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: QueryOptions?, buf: ByteBuffer) {
         if (value == null) {
             buf.put(0)
         } else {
@@ -17109,7 +16418,10 @@ public object FfiConverterOptionalTypeQueryOptions : FfiConverterRustBuffer<Quer
     }
 }
 
-public object FfiConverterSequenceString : FfiConverterRustBuffer<List<kotlin.String>> {
+
+
+
+public object FfiConverterSequenceString: FfiConverterRustBuffer<List<kotlin.String>> {
     override fun read(buf: ByteBuffer): List<kotlin.String> {
         val len = buf.getInt()
         return List<kotlin.String>(len) {
@@ -17123,10 +16435,7 @@ public object FfiConverterSequenceString : FfiConverterRustBuffer<List<kotlin.St
         return sizeForLength + sizeForItems
     }
 
-    override fun write(
-        value: List<kotlin.String>,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: List<kotlin.String>, buf: ByteBuffer) {
         buf.putInt(value.size)
         value.iterator().forEach {
             FfiConverterString.write(it, buf)
@@ -17134,7 +16443,10 @@ public object FfiConverterSequenceString : FfiConverterRustBuffer<List<kotlin.St
     }
 }
 
-public object FfiConverterSequenceTypeAuthorId : FfiConverterRustBuffer<List<AuthorId>> {
+
+
+
+public object FfiConverterSequenceTypeAuthorId: FfiConverterRustBuffer<List<AuthorId>> {
     override fun read(buf: ByteBuffer): List<AuthorId> {
         val len = buf.getInt()
         return List<AuthorId>(len) {
@@ -17148,10 +16460,7 @@ public object FfiConverterSequenceTypeAuthorId : FfiConverterRustBuffer<List<Aut
         return sizeForLength + sizeForItems
     }
 
-    override fun write(
-        value: List<AuthorId>,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: List<AuthorId>, buf: ByteBuffer) {
         buf.putInt(value.size)
         value.iterator().forEach {
             FfiConverterTypeAuthorId.write(it, buf)
@@ -17159,7 +16468,10 @@ public object FfiConverterSequenceTypeAuthorId : FfiConverterRustBuffer<List<Aut
     }
 }
 
-public object FfiConverterSequenceTypeDirectAddrInfo : FfiConverterRustBuffer<List<DirectAddrInfo>> {
+
+
+
+public object FfiConverterSequenceTypeDirectAddrInfo: FfiConverterRustBuffer<List<DirectAddrInfo>> {
     override fun read(buf: ByteBuffer): List<DirectAddrInfo> {
         val len = buf.getInt()
         return List<DirectAddrInfo>(len) {
@@ -17173,10 +16485,7 @@ public object FfiConverterSequenceTypeDirectAddrInfo : FfiConverterRustBuffer<Li
         return sizeForLength + sizeForItems
     }
 
-    override fun write(
-        value: List<DirectAddrInfo>,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: List<DirectAddrInfo>, buf: ByteBuffer) {
         buf.putInt(value.size)
         value.iterator().forEach {
             FfiConverterTypeDirectAddrInfo.write(it, buf)
@@ -17184,7 +16493,10 @@ public object FfiConverterSequenceTypeDirectAddrInfo : FfiConverterRustBuffer<Li
     }
 }
 
-public object FfiConverterSequenceTypeEntry : FfiConverterRustBuffer<List<Entry>> {
+
+
+
+public object FfiConverterSequenceTypeEntry: FfiConverterRustBuffer<List<Entry>> {
     override fun read(buf: ByteBuffer): List<Entry> {
         val len = buf.getInt()
         return List<Entry>(len) {
@@ -17198,10 +16510,7 @@ public object FfiConverterSequenceTypeEntry : FfiConverterRustBuffer<List<Entry>
         return sizeForLength + sizeForItems
     }
 
-    override fun write(
-        value: List<Entry>,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: List<Entry>, buf: ByteBuffer) {
         buf.putInt(value.size)
         value.iterator().forEach {
             FfiConverterTypeEntry.write(it, buf)
@@ -17209,7 +16518,10 @@ public object FfiConverterSequenceTypeEntry : FfiConverterRustBuffer<List<Entry>
     }
 }
 
-public object FfiConverterSequenceTypeFilterKind : FfiConverterRustBuffer<List<FilterKind>> {
+
+
+
+public object FfiConverterSequenceTypeFilterKind: FfiConverterRustBuffer<List<FilterKind>> {
     override fun read(buf: ByteBuffer): List<FilterKind> {
         val len = buf.getInt()
         return List<FilterKind>(len) {
@@ -17223,10 +16535,7 @@ public object FfiConverterSequenceTypeFilterKind : FfiConverterRustBuffer<List<F
         return sizeForLength + sizeForItems
     }
 
-    override fun write(
-        value: List<FilterKind>,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: List<FilterKind>, buf: ByteBuffer) {
         buf.putInt(value.size)
         value.iterator().forEach {
             FfiConverterTypeFilterKind.write(it, buf)
@@ -17234,7 +16543,10 @@ public object FfiConverterSequenceTypeFilterKind : FfiConverterRustBuffer<List<F
     }
 }
 
-public object FfiConverterSequenceTypeHash : FfiConverterRustBuffer<List<Hash>> {
+
+
+
+public object FfiConverterSequenceTypeHash: FfiConverterRustBuffer<List<Hash>> {
     override fun read(buf: ByteBuffer): List<Hash> {
         val len = buf.getInt()
         return List<Hash>(len) {
@@ -17248,10 +16560,7 @@ public object FfiConverterSequenceTypeHash : FfiConverterRustBuffer<List<Hash>> 
         return sizeForLength + sizeForItems
     }
 
-    override fun write(
-        value: List<Hash>,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: List<Hash>, buf: ByteBuffer) {
         buf.putInt(value.size)
         value.iterator().forEach {
             FfiConverterTypeHash.write(it, buf)
@@ -17259,7 +16568,10 @@ public object FfiConverterSequenceTypeHash : FfiConverterRustBuffer<List<Hash>> 
     }
 }
 
-public object FfiConverterSequenceTypeNodeAddr : FfiConverterRustBuffer<List<NodeAddr>> {
+
+
+
+public object FfiConverterSequenceTypeNodeAddr: FfiConverterRustBuffer<List<NodeAddr>> {
     override fun read(buf: ByteBuffer): List<NodeAddr> {
         val len = buf.getInt()
         return List<NodeAddr>(len) {
@@ -17273,10 +16585,7 @@ public object FfiConverterSequenceTypeNodeAddr : FfiConverterRustBuffer<List<Nod
         return sizeForLength + sizeForItems
     }
 
-    override fun write(
-        value: List<NodeAddr>,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: List<NodeAddr>, buf: ByteBuffer) {
         buf.putInt(value.size)
         value.iterator().forEach {
             FfiConverterTypeNodeAddr.write(it, buf)
@@ -17284,7 +16593,10 @@ public object FfiConverterSequenceTypeNodeAddr : FfiConverterRustBuffer<List<Nod
     }
 }
 
-public object FfiConverterSequenceTypeCollectionInfo : FfiConverterRustBuffer<List<CollectionInfo>> {
+
+
+
+public object FfiConverterSequenceTypeCollectionInfo: FfiConverterRustBuffer<List<CollectionInfo>> {
     override fun read(buf: ByteBuffer): List<CollectionInfo> {
         val len = buf.getInt()
         return List<CollectionInfo>(len) {
@@ -17298,10 +16610,7 @@ public object FfiConverterSequenceTypeCollectionInfo : FfiConverterRustBuffer<Li
         return sizeForLength + sizeForItems
     }
 
-    override fun write(
-        value: List<CollectionInfo>,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: List<CollectionInfo>, buf: ByteBuffer) {
         buf.putInt(value.size)
         value.iterator().forEach {
             FfiConverterTypeCollectionInfo.write(it, buf)
@@ -17309,7 +16618,10 @@ public object FfiConverterSequenceTypeCollectionInfo : FfiConverterRustBuffer<Li
     }
 }
 
-public object FfiConverterSequenceTypeConnectionInfo : FfiConverterRustBuffer<List<ConnectionInfo>> {
+
+
+
+public object FfiConverterSequenceTypeConnectionInfo: FfiConverterRustBuffer<List<ConnectionInfo>> {
     override fun read(buf: ByteBuffer): List<ConnectionInfo> {
         val len = buf.getInt()
         return List<ConnectionInfo>(len) {
@@ -17323,10 +16635,7 @@ public object FfiConverterSequenceTypeConnectionInfo : FfiConverterRustBuffer<Li
         return sizeForLength + sizeForItems
     }
 
-    override fun write(
-        value: List<ConnectionInfo>,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: List<ConnectionInfo>, buf: ByteBuffer) {
         buf.putInt(value.size)
         value.iterator().forEach {
             FfiConverterTypeConnectionInfo.write(it, buf)
@@ -17334,7 +16643,10 @@ public object FfiConverterSequenceTypeConnectionInfo : FfiConverterRustBuffer<Li
     }
 }
 
-public object FfiConverterSequenceTypeIncompleteBlobInfo : FfiConverterRustBuffer<List<IncompleteBlobInfo>> {
+
+
+
+public object FfiConverterSequenceTypeIncompleteBlobInfo: FfiConverterRustBuffer<List<IncompleteBlobInfo>> {
     override fun read(buf: ByteBuffer): List<IncompleteBlobInfo> {
         val len = buf.getInt()
         return List<IncompleteBlobInfo>(len) {
@@ -17348,10 +16660,7 @@ public object FfiConverterSequenceTypeIncompleteBlobInfo : FfiConverterRustBuffe
         return sizeForLength + sizeForItems
     }
 
-    override fun write(
-        value: List<IncompleteBlobInfo>,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: List<IncompleteBlobInfo>, buf: ByteBuffer) {
         buf.putInt(value.size)
         value.iterator().forEach {
             FfiConverterTypeIncompleteBlobInfo.write(it, buf)
@@ -17359,7 +16668,10 @@ public object FfiConverterSequenceTypeIncompleteBlobInfo : FfiConverterRustBuffe
     }
 }
 
-public object FfiConverterSequenceTypeLinkAndName : FfiConverterRustBuffer<List<LinkAndName>> {
+
+
+
+public object FfiConverterSequenceTypeLinkAndName: FfiConverterRustBuffer<List<LinkAndName>> {
     override fun read(buf: ByteBuffer): List<LinkAndName> {
         val len = buf.getInt()
         return List<LinkAndName>(len) {
@@ -17373,10 +16685,7 @@ public object FfiConverterSequenceTypeLinkAndName : FfiConverterRustBuffer<List<
         return sizeForLength + sizeForItems
     }
 
-    override fun write(
-        value: List<LinkAndName>,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: List<LinkAndName>, buf: ByteBuffer) {
         buf.putInt(value.size)
         value.iterator().forEach {
             FfiConverterTypeLinkAndName.write(it, buf)
@@ -17384,7 +16693,10 @@ public object FfiConverterSequenceTypeLinkAndName : FfiConverterRustBuffer<List<
     }
 }
 
-public object FfiConverterSequenceTypeNamespaceAndCapability : FfiConverterRustBuffer<List<NamespaceAndCapability>> {
+
+
+
+public object FfiConverterSequenceTypeNamespaceAndCapability: FfiConverterRustBuffer<List<NamespaceAndCapability>> {
     override fun read(buf: ByteBuffer): List<NamespaceAndCapability> {
         val len = buf.getInt()
         return List<NamespaceAndCapability>(len) {
@@ -17398,10 +16710,7 @@ public object FfiConverterSequenceTypeNamespaceAndCapability : FfiConverterRustB
         return sizeForLength + sizeForItems
     }
 
-    override fun write(
-        value: List<NamespaceAndCapability>,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: List<NamespaceAndCapability>, buf: ByteBuffer) {
         buf.putInt(value.size)
         value.iterator().forEach {
             FfiConverterTypeNamespaceAndCapability.write(it, buf)
@@ -17409,7 +16718,10 @@ public object FfiConverterSequenceTypeNamespaceAndCapability : FfiConverterRustB
     }
 }
 
-public object FfiConverterSequenceTypeTagInfo : FfiConverterRustBuffer<List<TagInfo>> {
+
+
+
+public object FfiConverterSequenceTypeTagInfo: FfiConverterRustBuffer<List<TagInfo>> {
     override fun read(buf: ByteBuffer): List<TagInfo> {
         val len = buf.getInt()
         return List<TagInfo>(len) {
@@ -17423,10 +16735,7 @@ public object FfiConverterSequenceTypeTagInfo : FfiConverterRustBuffer<List<TagI
         return sizeForLength + sizeForItems
     }
 
-    override fun write(
-        value: List<TagInfo>,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: List<TagInfo>, buf: ByteBuffer) {
         buf.putInt(value.size)
         value.iterator().forEach {
             FfiConverterTypeTagInfo.write(it, buf)
@@ -17434,7 +16743,9 @@ public object FfiConverterSequenceTypeTagInfo : FfiConverterRustBuffer<List<TagI
     }
 }
 
-public object FfiConverterMapStringTypeCounterStats : FfiConverterRustBuffer<Map<kotlin.String, CounterStats>> {
+
+
+public object FfiConverterMapStringTypeCounterStats: FfiConverterRustBuffer<Map<kotlin.String, CounterStats>> {
     override fun read(buf: ByteBuffer): Map<kotlin.String, CounterStats> {
         val len = buf.getInt()
         return buildMap<kotlin.String, CounterStats>(len) {
@@ -17448,19 +16759,14 @@ public object FfiConverterMapStringTypeCounterStats : FfiConverterRustBuffer<Map
 
     override fun allocationSize(value: Map<kotlin.String, CounterStats>): ULong {
         val spaceForMapSize = 4UL
-        val spaceForChildren =
-            value
-                .map { (k, v) ->
-                    FfiConverterString.allocationSize(k) +
-                        FfiConverterTypeCounterStats.allocationSize(v)
-                }.sum()
+        val spaceForChildren = value.map { (k, v) ->
+            FfiConverterString.allocationSize(k) +
+            FfiConverterTypeCounterStats.allocationSize(v)
+        }.sum()
         return spaceForMapSize + spaceForChildren
     }
 
-    override fun write(
-        value: Map<kotlin.String, CounterStats>,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: Map<kotlin.String, CounterStats>, buf: ByteBuffer) {
         buf.putInt(value.size)
         // The parens on `(k, v)` here ensure we're calling the right method,
         // which is important for compatibility with older android devices.
@@ -17472,71 +16778,67 @@ public object FfiConverterMapStringTypeCounterStats : FfiConverterRustBuffer<Map
     }
 }
 
-/**
- * Helper function that translates a key that was derived from the [`path_to_key`] function back
- * into a path.
- *
- * If `prefix` exists, it will be stripped before converting back to a path
- * If `root` exists, will add the root as a parent to the created path
- * Removes any null byte that has been appened to the key
- */
-@Throws(IrohException::class)
-fun `keyToPath`(
-    `key`: kotlin.ByteArray,
-    `prefix`: kotlin.String?,
-    `root`: kotlin.String?,
-): kotlin.String =
-    FfiConverterString.lift(
-        uniffiRustCallWithError(IrohException) { _status ->
-            UniffiLib.INSTANCE.uniffi_iroh_fn_func_key_to_path(
-                FfiConverterByteArray.lower(`key`),
-                FfiConverterOptionalString.lower(`prefix`),
-                FfiConverterOptionalString.lower(`root`),
-                _status,
-            )
-        },
-    )
 
-/**
- * Helper function that creates a document key from a canonicalized path, removing the `root` and adding the `prefix`, if they exist
- *
- * Appends the null byte to the end of the key.
- */
-@Throws(IrohException::class)
-fun `pathToKey`(
-    `path`: kotlin.String,
-    `prefix`: kotlin.String?,
-    `root`: kotlin.String?,
-): kotlin.ByteArray =
-    FfiConverterByteArray.lift(
-        uniffiRustCallWithError(IrohException) { _status ->
-            UniffiLib.INSTANCE.uniffi_iroh_fn_func_path_to_key(
-                FfiConverterString.lower(`path`),
-                FfiConverterOptionalString.lower(`prefix`),
-                FfiConverterOptionalString.lower(`root`),
-                _status,
-            )
-        },
-    )
 
-/**
- * Set the logging level.
- */
-fun `setLogLevel`(`level`: LogLevel) =
-    uniffiRustCall { _status ->
-        UniffiLib.INSTANCE.uniffi_iroh_fn_func_set_log_level(
-            FfiConverterTypeLogLevel.lower(`level`),
-            _status,
-        )
-    }
 
-/**
- * Initialize the global metrics collection.
- */
-@Throws(IrohException::class)
-fun `startMetricsCollection`() =
+
+
+
+
+        /**
+         * Helper function that translates a key that was derived from the [`path_to_key`] function back
+         * into a path.
+         *
+         * If `prefix` exists, it will be stripped before converting back to a path
+         * If `root` exists, will add the root as a parent to the created path
+         * Removes any null byte that has been appened to the key
+         */
+    @Throws(IrohException::class) fun `keyToPath`(`key`: kotlin.ByteArray, `prefix`: kotlin.String?, `root`: kotlin.String?): kotlin.String {
+            return FfiConverterString.lift(
     uniffiRustCallWithError(IrohException) { _status ->
-        UniffiLib.INSTANCE.uniffi_iroh_fn_func_start_metrics_collection(
-            _status,
-        )
+    UniffiLib.INSTANCE.uniffi_iroh_fn_func_key_to_path(
+        FfiConverterByteArray.lower(`key`),FfiConverterOptionalString.lower(`prefix`),FfiConverterOptionalString.lower(`root`),_status)
+}
+    )
     }
+    
+
+        /**
+         * Helper function that creates a document key from a canonicalized path, removing the `root` and adding the `prefix`, if they exist
+         *
+         * Appends the null byte to the end of the key.
+         */
+    @Throws(IrohException::class) fun `pathToKey`(`path`: kotlin.String, `prefix`: kotlin.String?, `root`: kotlin.String?): kotlin.ByteArray {
+            return FfiConverterByteArray.lift(
+    uniffiRustCallWithError(IrohException) { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_func_path_to_key(
+        FfiConverterString.lower(`path`),FfiConverterOptionalString.lower(`prefix`),FfiConverterOptionalString.lower(`root`),_status)
+}
+    )
+    }
+    
+
+        /**
+         * Set the logging level.
+         */ fun `setLogLevel`(`level`: LogLevel)
+        = 
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_func_set_log_level(
+        FfiConverterTypeLogLevel.lower(`level`),_status)
+}
+    
+    
+
+        /**
+         * Initialize the global metrics collection.
+         */
+    @Throws(IrohException::class) fun `startMetricsCollection`()
+        = 
+    uniffiRustCallWithError(IrohException) { _status ->
+    UniffiLib.INSTANCE.uniffi_iroh_fn_func_start_metrics_collection(
+        _status)
+}
+    
+    
+
+
