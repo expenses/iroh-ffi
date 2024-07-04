@@ -225,7 +225,7 @@ impl Default for NodeOptions {
 /// An Iroh node. Allows you to sync, store, and transfer data.
 #[derive(uniffi::Object)]
 pub struct IrohNode {
-    pub(crate) node: FsNode,
+    pub node: FsNode,
 }
 
 #[uniffi::export]

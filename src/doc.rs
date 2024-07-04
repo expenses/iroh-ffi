@@ -129,7 +129,7 @@ pub struct NamespaceAndCapability {
 /// A representation of a mutable, synchronizable key-value store.
 #[derive(Clone, uniffi::Object)]
 pub struct Doc {
-    pub(crate) inner: MemDoc,
+    pub inner: MemDoc,
 }
 
 #[uniffi::export]

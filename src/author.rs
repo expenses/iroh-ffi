@@ -7,7 +7,7 @@ use crate::{IrohError, IrohNode};
 /// Identifier for an [`Author`]
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Object)]
 #[uniffi::export(Display)]
-pub struct AuthorId(pub(crate) iroh::docs::AuthorId);
+pub struct AuthorId(pub iroh::docs::AuthorId);
 
 impl std::fmt::Display for AuthorId {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
