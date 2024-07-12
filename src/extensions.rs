@@ -25,7 +25,7 @@ pub struct DocData {
 }
 
 impl DocData {
-    fn update(&self) -> Result<Vec<PathBuf>, anyhow::Error> {
+    fn update(&self, recheck: bool) -> Result<Vec<PathBuf>, anyhow::Error> {
         let mut current = FileData::new();
         let old = self.files.load();
         let mut to_update = Vec::new();
@@ -49,7 +49,7 @@ impl DocData {
                         None => true,
                     };
 
-                    if updated {
+                    if updated || recheck {
                         to_update.push(path);
                     }
                 }
@@ -158,10 +158,11 @@ impl Backend {
         namespace: String,
         author: Arc<AuthorId>,
         in_place: bool,
+        recheck: bool,
         cb: Option<Arc<dyn ImportTreeCallback>>,
     ) -> Result<(), IrohError> {
         let doc_data = self.doc_data(namespace);
-        let to_update = doc_data.update()?;
+        let to_update = doc_data.update(recheck)?;
         self.write_sources()?;
 
         if let Some(ref cb) = cb {
