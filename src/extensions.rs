@@ -189,18 +189,18 @@ impl Backend {
 
 #[derive(uniffi::Record)]
 pub struct QrCode {
-    bytes: Vec<u8>,
-    width: u32
+    bytes: Vec<i32>,
+    width: i32
 }
 
 #[uniffi::export]
 pub fn create_qr_code(string: String) -> Result<QrCode, IrohError> {
     let qr = qrcode::QrCode::new(&string).map_err(|err| anyhow::anyhow!("{}", err))?;
 
-    let image = qr.render::<image::Luma<u8>>().build();
+    let image = qr.render::<image::Luma<u8>>().dark_color(image::Luma([255])).light_color(image::Luma([0])).quiet_zone(false).build();
 
     Ok(QrCode {
-        width: image.width(),
-        bytes: image.into_raw()
+        width: image.width() as _,
+        bytes: image.into_raw().into_iter().map(|byte| byte as _).collect()
     })
 }
