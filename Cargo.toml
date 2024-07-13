@@ -48,10 +48,10 @@ tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.17" }
 serde = { version = "1.0.196", features = ["derive"] }
 serde_json = "1.0.113"
-walkdir = "2.5.0"
-arc-swap = { version = "1.7.1", features = ["serde"] }
 qrcode = { version = "0.14.1", default-features = false, features = ["image"] }
 image = { version = "0.25.1", default-features = false }
+async-walkdir = "2.0.0"
+parking_lot = { version = "0.12.3", features = ["serde"] }
 
 [dev-dependencies]
 rand = "0.8"

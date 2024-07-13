@@ -1,12 +1,13 @@
 use crate::*;
-use arc_swap::ArcSwap;
+use async_walkdir::DirEntry;
 use bytes::Bytes;
+use futures::future::ready;
 use futures::StreamExt;
+use parking_lot::RwLock;
 use std::collections::{hash_map, HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::SystemTime;
-use walkdir::DirEntry;
 
 fn is_hidden(entry: &DirEntry) -> bool {
     entry
@@ -21,25 +22,36 @@ type FileData = HashMap<PathBuf, (u64, SystemTime)>;
 #[derive(Default, serde::Serialize, serde::Deserialize)]
 pub struct DocData {
     sources: RwLock<HashSet<String>>,
-    files: ArcSwap<FileData>,
+    files: RwLock<Arc<FileData>>,
 }
 
 impl DocData {
-    fn update(&self, recheck: bool) -> Result<Vec<PathBuf>, anyhow::Error> {
+    async fn update(&self, recheck: bool) -> Result<Vec<PathBuf>, anyhow::Error> {
         let mut current = FileData::new();
-        let old = self.files.load();
+        let old = self.files.read().clone();
         let mut to_update = Vec::new();
 
-        for source in self.sources.read().unwrap().iter() {
-            for entry in walkdir::WalkDir::new(source)
-                .into_iter()
-                .filter_entry(|e| !is_hidden(e))
-                .filter_map(|e| e.ok())
-                .filter(|e| e.file_type().is_file())
-            {
+        let sources = self.sources.read().clone();
+
+        for source in sources {
+            let mut stream = async_walkdir::WalkDir::new(source)
+                .filter(|e| {
+                    ready(if is_hidden(&e) {
+                        async_walkdir::Filtering::IgnoreDir
+                    } else {
+                        async_walkdir::Filtering::Continue
+                    })
+                })
+                .filter_map(|e| ready(e.ok()));
+
+            while let Some(entry) = stream.next().await {
+                if !entry.file_type().await?.is_file() {
+                    continue;
+                }
+
                 let path = PathBuf::from(entry.path());
                 if let hash_map::Entry::Vacant(map_entry) = current.entry(path.clone()) {
-                    let metadata = entry.metadata()?;
+                    let metadata = entry.metadata().await?;
                     let modified = metadata.modified()?;
                     let data = (metadata.len(), modified);
                     map_entry.insert(data);
@@ -56,7 +68,7 @@ impl DocData {
             }
         }
 
-        self.files.swap(Arc::new(current));
+        *self.files.write() = Arc::new(current);
 
         Ok(to_update)
     }
@@ -79,16 +91,14 @@ pub struct Backend {
 
 impl Backend {
     fn doc_data(&self, namespace: String) -> Arc<DocData> {
-        self.doc_data
-            .write()
-            .unwrap()
-            .entry(namespace)
-            .or_default()
-            .clone()
+        self.doc_data.write().entry(namespace).or_default().clone()
     }
 
     fn write_sources(&self) -> anyhow::Result<()> {
-        serde_json::to_writer(std::fs::File::create(self.app_storage_path.join("sources.json"))?, &self.doc_data)?;
+        serde_json::to_writer(
+            std::fs::File::create(self.app_storage_path.join("sources.json"))?,
+            &self.doc_data,
+        )?;
         Ok(())
     }
 }
@@ -100,14 +110,18 @@ impl Backend {
         let app_storage_path = PathBuf::from(app_storage_path);
 
         let load_doc_data = || -> anyhow::Result<HashMap<String, Arc<DocData>>> {
-            let doc_data = serde_json::from_reader(std::fs::File::open(app_storage_path.join("sources.json"))?)?;
+            let doc_data = serde_json::from_reader(std::fs::File::open(
+                app_storage_path.join("sources.json"),
+            )?)?;
             Ok(doc_data)
         };
 
         Ok(Self {
-            node: Arc::new(IrohNode::persistent(app_storage_path.join("iroh").display().to_string()).await?),
+            node: Arc::new(
+                IrohNode::persistent(app_storage_path.join("iroh").display().to_string()).await?,
+            ),
             doc_data: RwLock::new(load_doc_data().unwrap_or_default()),
-            app_storage_path
+            app_storage_path,
         })
     }
 
@@ -124,26 +138,17 @@ impl Backend {
         self.doc_data(namespace)
             .sources
             .read()
-            .unwrap()
             .iter()
             .cloned()
             .collect()
     }
 
     pub fn add_source_to_document(&self, namespace: String, source: String) {
-        self.doc_data(namespace)
-            .sources
-            .write()
-            .unwrap()
-            .insert(source);
+        self.doc_data(namespace).sources.write().insert(source);
     }
 
     pub fn remove_source_from_document(&self, namespace: String, source: String) {
-        self.doc_data(namespace)
-            .sources
-            .write()
-            .unwrap()
-            .remove(&source);
+        self.doc_data(namespace).sources.write().remove(&source);
     }
 
     pub fn serialize(&self) -> Result<String, IrohError> {
@@ -162,12 +167,13 @@ impl Backend {
         cb: Option<Arc<dyn ImportTreeCallback>>,
     ) -> Result<(), IrohError> {
         let doc_data = self.doc_data(namespace);
-        let to_update = doc_data.update(recheck)?;
+        let to_update = doc_data.update(recheck).await?;
         self.write_sources()?;
 
         if let Some(ref cb) = cb {
             cb.to_update(to_update.len() as _).await?;
-            cb.total(doc_data.files.load().len() as _).await?;
+            let total = doc_data.files.read().len() as _;
+            cb.total(total).await?;
         }
 
         for path in to_update {
@@ -189,18 +195,23 @@ impl Backend {
 
 #[derive(uniffi::Record)]
 pub struct QrCode {
-    bytes: Vec<i32>,
-    width: i32
+    bytes: Vec<u8>,
+    width: i32,
 }
 
 #[uniffi::export]
 pub fn create_qr_code(string: String) -> Result<QrCode, IrohError> {
     let qr = qrcode::QrCode::new(&string).map_err(|err| anyhow::anyhow!("{}", err))?;
 
-    let image = qr.render::<image::Luma<u8>>().dark_color(image::Luma([255])).light_color(image::Luma([0])).quiet_zone(false).build();
+    let image = qr
+        .render::<image::Luma<u8>>()
+        .dark_color(image::Luma([255]))
+        .light_color(image::Luma([0]))
+        .quiet_zone(false)
+        .build();
 
     Ok(QrCode {
         width: image.width() as _,
-        bytes: image.into_raw().into_iter().map(|byte| byte as _).collect()
+        bytes: image.into_raw(),
     })
 }
