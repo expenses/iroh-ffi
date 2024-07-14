@@ -21,7 +21,7 @@ type FileData = HashMap<PathBuf, (u64, SystemTime)>;
 
 #[derive(Default, serde::Serialize, serde::Deserialize)]
 pub struct DocData {
-    sources: RwLock<HashSet<String>>,
+    sources: RwLock<HashSet<PathBuf>>,
     files: RwLock<Arc<FileData>>,
 }
 
@@ -33,7 +33,7 @@ impl DocData {
 
         let sources = self.sources.read().clone();
 
-        for source in sources {
+        for source in sources.iter() {
             let mut stream = async_walkdir::WalkDir::new(source)
                 .filter(|e| {
                     ready(if is_hidden(&e) {
@@ -134,26 +134,31 @@ impl Backend {
         self.node.clone()
     }
 
+    pub fn num_files_for_document(&self, namespace: String) -> u64 {
+        self.doc_data(namespace).files.read().len() as _
+    }
+
     pub fn sources_for_document(&self, namespace: String) -> Vec<String> {
         self.doc_data(namespace)
             .sources
             .read()
             .iter()
-            .cloned()
+            .map(|path| path.display().to_string())
             .collect()
     }
 
     pub fn add_source_to_document(&self, namespace: String, source: String) {
-        self.doc_data(namespace).sources.write().insert(source);
+        self.doc_data(namespace)
+            .sources
+            .write()
+            .insert(PathBuf::from(source));
     }
 
     pub fn remove_source_from_document(&self, namespace: String, source: String) {
-        self.doc_data(namespace).sources.write().remove(&source);
-    }
-
-    pub fn serialize(&self) -> Result<String, IrohError> {
-        serde_json::to_string(&self.doc_data)
-            .map_err(|err| IrohError::from(anyhow::anyhow!("{}", err)))
+        self.doc_data(namespace)
+            .sources
+            .write()
+            .remove(&PathBuf::from(source));
     }
 
     #[uniffi::method(async_runtime = "tokio")]
