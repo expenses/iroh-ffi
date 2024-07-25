@@ -6,6 +6,7 @@ use futures::StreamExt;
 use parking_lot::RwLock;
 use std::collections::{hash_map, HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -25,61 +26,31 @@ pub struct DocData {
     files: RwLock<Arc<FileData>>,
 }
 
-impl DocData {
-    async fn update(&self, recheck: bool) -> Result<Vec<PathBuf>, anyhow::Error> {
-        let mut current = FileData::new();
-        let old = self.files.read().clone();
-        let mut to_update = Vec::new();
+#[derive(uniffi::Record)]
+pub struct UpdateStatus {
+    pub found: u64,
+    pub updated: u64,
+}
 
-        let sources = self.sources.read().clone();
+#[derive(Default)]
+struct UpdateStatusAtomic {
+    pub found: AtomicU64,
+    pub updated: AtomicU64,
+}
 
-        for source in sources.iter() {
-            let mut stream = async_walkdir::WalkDir::new(source)
-                .filter(|e| {
-                    ready(if is_hidden(&e) {
-                        async_walkdir::Filtering::IgnoreDir
-                    } else {
-                        async_walkdir::Filtering::Continue
-                    })
-                })
-                .filter_map(|e| ready(e.ok()));
-
-            while let Some(entry) = stream.next().await {
-                if !entry.file_type().await?.is_file() {
-                    continue;
-                }
-
-                let path = PathBuf::from(entry.path());
-                if let hash_map::Entry::Vacant(map_entry) = current.entry(path.clone()) {
-                    let metadata = entry.metadata().await?;
-                    let modified = metadata.modified()?;
-                    let data = (metadata.len(), modified);
-                    map_entry.insert(data);
-
-                    let updated = match old.get(&path) {
-                        Some(old_data) => old_data != &data,
-                        None => true,
-                    };
-
-                    if updated || recheck {
-                        to_update.push(path);
-                    }
-                }
-            }
+impl UpdateStatusAtomic {
+    fn resolve(&self) -> UpdateStatus {
+        UpdateStatus {
+            found: self.found.load(Ordering::SeqCst),
+            updated: self.updated.load(Ordering::SeqCst),
         }
-
-        *self.files.write() = Arc::new(current);
-
-        Ok(to_update)
     }
 }
 
 #[uniffi::export(with_foreign)]
 #[async_trait::async_trait]
 pub trait ImportTreeCallback: Send + Sync + 'static {
-    async fn progress(&self) -> Result<(), CallbackError>;
-    async fn to_update(&self, to_update: u64) -> Result<(), CallbackError>;
-    async fn total(&self, total: u64) -> Result<(), CallbackError>;
+    async fn callback(&self, status: UpdateStatus) -> Result<(), CallbackError>;
 }
 
 #[derive(uniffi::Object)]
@@ -164,35 +135,109 @@ impl Backend {
     #[uniffi::method(async_runtime = "tokio")]
     pub async fn add_file_tree(
         &self,
-        doc: &Doc,
+        doc: Arc<Doc>,
         namespace: String,
         author: Arc<AuthorId>,
         in_place: bool,
         recheck: bool,
         cb: Option<Arc<dyn ImportTreeCallback>>,
     ) -> Result<(), IrohError> {
-        let doc_data = self.doc_data(namespace);
-        let to_update = doc_data.update(recheck).await?;
-        self.write_sources()?;
+        let status = &UpdateStatusAtomic::default();
+        let cb = cb.as_ref();
 
-        if let Some(ref cb) = cb {
-            cb.to_update(to_update.len() as _).await?;
-            let total = doc_data.files.read().len() as _;
-            cb.total(total).await?;
-        }
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<PathBuf>();
 
-        for path in to_update {
-            let path_str = (*path.to_string_lossy()).as_bytes().to_vec();
-            let key = Bytes::from(path_str);
+        tokio_scoped::scope(|scope| {
+            scope.spawn(async move {
+                let fut = || async move {
+                    while let Some(path) = rx.recv().await {
+                        let path_str = (*path.to_string_lossy()).as_bytes().to_vec();
+                        let key = Bytes::from(path_str);
 
-            let mut stream = doc.inner.import_file(author.0, key, path, in_place).await?;
+                        let mut stream = doc
+                            .inner
+                            .import_file(author.0, key, path, in_place)
+                            .await
+                            .map_err(|err| anyhow::anyhow!("{}", err))?;
 
-            while stream.next().await.is_some() {}
+                        while stream.next().await.is_some() {}
+                        status.updated.fetch_add(1, Ordering::SeqCst);
+                        if let Some(cb) = cb.as_ref() {
+                            cb.callback(status.resolve()).await?;
+                        }
+                    }
 
-            if let Some(ref cb) = cb {
-                cb.progress().await?;
-            }
-        }
+                    anyhow::Ok(())
+                };
+
+                if let Err(err) = fut().await {
+                    log::error!("{}", err);
+                }
+            });
+
+            scope.block_on(async move {
+                let doc_data = self.doc_data(namespace);
+
+                let mut current = FileData::new();
+                let old = doc_data.files.read().clone();
+                let sources = doc_data.sources.read().clone();
+
+                for source in sources.iter() {
+                    let mut stream = async_walkdir::WalkDir::new(source)
+                        .filter(|e| {
+                            ready(if is_hidden(&e) {
+                                async_walkdir::Filtering::IgnoreDir
+                            } else {
+                                async_walkdir::Filtering::Continue
+                            })
+                        })
+                        .filter_map(|e| ready(e.ok()));
+
+                    while let Some(entry) = stream.next().await {
+                        if !entry
+                            .file_type()
+                            .await
+                            .map_err(|err| anyhow::anyhow!("{}", err))?
+                            .is_file()
+                        {
+                            continue;
+                        }
+
+                        let path = PathBuf::from(entry.path());
+                        if let hash_map::Entry::Vacant(map_entry) = current.entry(path.clone()) {
+                            let metadata = entry
+                                .metadata()
+                                .await
+                                .map_err(|err| anyhow::anyhow!("{}", err))?;
+                            let modified = metadata
+                                .modified()
+                                .map_err(|err| anyhow::anyhow!("{}", err))?;
+                            let data = (metadata.len(), modified);
+                            map_entry.insert(data);
+
+                            let updated = match old.get(&path) {
+                                Some(old_data) => old_data != &data,
+                                None => true,
+                            };
+
+                            if updated || recheck {
+                                tx.send(path).unwrap();
+                                status.found.fetch_add(1, Ordering::SeqCst);
+                                if let Some(cb) = cb.as_ref() {
+                                    cb.callback(status.resolve()).await?;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                *doc_data.files.write() = Arc::new(current);
+
+                self.write_sources()?;
+
+                anyhow::Ok(())
+            })
+        })?;
 
         Ok(())
     }
