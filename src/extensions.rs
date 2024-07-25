@@ -55,7 +55,7 @@ pub trait ImportTreeCallback: Send + Sync + 'static {
 
 #[derive(uniffi::Object)]
 pub struct Backend {
-    node: Arc<IrohNode>,
+    node: Arc<Iroh>,
     doc_data: RwLock<HashMap<String, Arc<DocData>>>,
     app_storage_path: PathBuf,
 }
@@ -89,7 +89,7 @@ impl Backend {
 
         Ok(Self {
             node: Arc::new(
-                IrohNode::persistent(app_storage_path.join("iroh").display().to_string()).await?,
+                Iroh::persistent(app_storage_path.join("iroh").display().to_string()).await?,
             ),
             doc_data: RwLock::new(load_doc_data().unwrap_or_default()),
             app_storage_path,
@@ -101,7 +101,7 @@ impl Backend {
         Self::new(iroh_database_path).await
     }
 
-    pub fn node(&self) -> Arc<IrohNode> {
+    pub fn node(&self) -> Arc<Iroh> {
         self.node.clone()
     }
 
