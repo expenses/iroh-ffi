@@ -175,69 +175,76 @@ impl Backend {
                 }
             });
 
-            scope.block_on(async move {
-                let doc_data = self.doc_data(namespace);
+            scope.spawn(async move {
+                let fut = || async move {
+                    let doc_data = self.doc_data(namespace);
 
-                let mut current = FileData::new();
-                let old = doc_data.files.read().clone();
-                let sources = doc_data.sources.read().clone();
+                    let mut current = FileData::new();
+                    let old = doc_data.files.read().clone();
+                    let sources = doc_data.sources.read().clone();
 
-                for source in sources.iter() {
-                    let mut stream = async_walkdir::WalkDir::new(source)
-                        .filter(|e| {
-                            ready(if is_hidden(&e) {
-                                async_walkdir::Filtering::IgnoreDir
-                            } else {
-                                async_walkdir::Filtering::Continue
+                    for source in sources.iter() {
+                        let mut stream = async_walkdir::WalkDir::new(source)
+                            .filter(|e| {
+                                ready(if is_hidden(&e) {
+                                    async_walkdir::Filtering::IgnoreDir
+                                } else {
+                                    async_walkdir::Filtering::Continue
+                                })
                             })
-                        })
-                        .filter_map(|e| ready(e.ok()));
+                            .filter_map(|e| ready(e.ok()));
 
-                    while let Some(entry) = stream.next().await {
-                        if !entry
-                            .file_type()
-                            .await
-                            .map_err(|err| anyhow::anyhow!("{}", err))?
-                            .is_file()
-                        {
-                            continue;
-                        }
-
-                        let path = PathBuf::from(entry.path());
-                        if let hash_map::Entry::Vacant(map_entry) = current.entry(path.clone()) {
-                            let metadata = entry
-                                .metadata()
+                        while let Some(entry) = stream.next().await {
+                            if !entry
+                                .file_type()
                                 .await
-                                .map_err(|err| anyhow::anyhow!("{}", err))?;
-                            let modified = metadata
-                                .modified()
-                                .map_err(|err| anyhow::anyhow!("{}", err))?;
-                            let data = (metadata.len(), modified);
-                            map_entry.insert(data);
+                                .map_err(|err| anyhow::anyhow!("{}", err))?
+                                .is_file()
+                            {
+                                continue;
+                            }
 
-                            let updated = match old.get(&path) {
-                                Some(old_data) => old_data != &data,
-                                None => true,
-                            };
+                            let path = entry.path();
+                            if let hash_map::Entry::Vacant(map_entry) = current.entry(path.clone())
+                            {
+                                let metadata = entry
+                                    .metadata()
+                                    .await
+                                    .map_err(|err| anyhow::anyhow!("{}", err))?;
+                                let modified = metadata
+                                    .modified()
+                                    .map_err(|err| anyhow::anyhow!("{}", err))?;
+                                let data = (metadata.len(), modified);
+                                map_entry.insert(data);
 
-                            if updated || recheck {
-                                tx.send(path).unwrap();
-                                status.found.fetch_add(1, Ordering::SeqCst);
-                                if let Some(cb) = cb.as_ref() {
-                                    cb.callback(status.resolve()).await?;
+                                let updated = match old.get(&path) {
+                                    Some(old_data) => old_data != &data,
+                                    None => true,
+                                };
+
+                                if updated || recheck {
+                                    tx.send(path).unwrap();
+                                    status.found.fetch_add(1, Ordering::SeqCst);
+                                    if let Some(cb) = cb.as_ref() {
+                                        cb.callback(status.resolve()).await?;
+                                    }
                                 }
                             }
                         }
                     }
+
+                    *doc_data.files.write() = Arc::new(current);
+
+                    self.write_sources()?;
+
+                    anyhow::Ok(())
+                };
+
+                if let Err(err) = fut().await {
+                    log::error!("{}", err);
                 }
-
-                *doc_data.files.write() = Arc::new(current);
-
-                self.write_sources()?;
-
-                anyhow::Ok(())
-            })
-        })?;
+            });
+        });
 
         Ok(())
     }
@@ -251,7 +258,7 @@ pub struct QrCode {
 
 #[uniffi::export]
 pub fn create_qr_code(string: String) -> Result<QrCode, IrohError> {
-    let qr = qrcode::QrCode::new(&string).map_err(|err| anyhow::anyhow!("{}", err))?;
+    let qr = qrcode::QrCode::new(string).map_err(|err| anyhow::anyhow!("{}", err))?;
 
     let image = qr
         .render::<image::Luma<u8>>()
