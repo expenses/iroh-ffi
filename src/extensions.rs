@@ -147,105 +147,93 @@ impl Backend {
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<PathBuf>();
 
-        tokio_scoped::scope(|scope| {
-            scope.spawn(async move {
-                let fut = || async move {
-                    while let Some(path) = rx.recv().await {
-                        let path_str = (*path.to_string_lossy()).as_bytes().to_vec();
-                        let key = Bytes::from(path_str);
+        let (res_a, res_b) = tokio::join!(
+            async move {
+                while let Some(path) = rx.recv().await {
+                    let path_str = (*path.to_string_lossy()).as_bytes().to_vec();
+                    let key = Bytes::from(path_str);
 
-                        let mut stream = doc
-                            .inner
-                            .import_file(author.0, key, path, in_place)
-                            .await
-                            .map_err(|err| anyhow::anyhow!("{}", err))?;
+                    let mut stream = doc
+                        .inner
+                        .import_file(author.0, key, path, in_place)
+                        .await
+                        .map_err(|err| anyhow::anyhow!("{}", err))?;
 
-                        while stream.next().await.is_some() {}
-                        status.updated.fetch_add(1, Ordering::SeqCst);
-                        if let Some(cb) = cb.as_ref() {
-                            cb.callback(status.resolve()).await?;
-                        }
+                    while stream.next().await.is_some() {}
+                    status.updated.fetch_add(1, Ordering::SeqCst);
+                    if let Some(cb) = cb.as_ref() {
+                        cb.callback(status.resolve()).await?;
                     }
-
-                    anyhow::Ok(())
-                };
-
-                if let Err(err) = fut().await {
-                    log::error!("{}", err);
                 }
-            });
 
-            scope.spawn(async move {
-                let fut = || async move {
-                    let doc_data = self.doc_data(namespace);
+                anyhow::Ok(())
+            },
+            async move {
+                let doc_data = self.doc_data(namespace);
 
-                    let mut current = FileData::new();
-                    let old = doc_data.files.read().clone();
-                    let sources = doc_data.sources.read().clone();
+                let mut current = FileData::new();
+                let old = doc_data.files.read().clone();
+                let sources = doc_data.sources.read().clone();
 
-                    for source in sources.iter() {
-                        let mut stream = async_walkdir::WalkDir::new(source)
-                            .filter(|e| {
-                                ready(if is_hidden(&e) {
-                                    async_walkdir::Filtering::IgnoreDir
-                                } else {
-                                    async_walkdir::Filtering::Continue
-                                })
+                for source in sources.iter() {
+                    let mut stream = async_walkdir::WalkDir::new(source)
+                        .filter(|e| {
+                            ready(if is_hidden(&e) {
+                                async_walkdir::Filtering::IgnoreDir
+                            } else {
+                                async_walkdir::Filtering::Continue
                             })
-                            .filter_map(|e| ready(e.ok()));
+                        })
+                        .filter_map(|e| ready(e.ok()));
 
-                        while let Some(entry) = stream.next().await {
-                            if !entry
-                                .file_type()
+                    while let Some(entry) = stream.next().await {
+                        if !entry
+                            .file_type()
+                            .await
+                            .map_err(|err| anyhow::anyhow!("{}", err))?
+                            .is_file()
+                        {
+                            continue;
+                        }
+
+                        let path = entry.path();
+                        if let hash_map::Entry::Vacant(map_entry) = current.entry(path.clone()) {
+                            let metadata = entry
+                                .metadata()
                                 .await
-                                .map_err(|err| anyhow::anyhow!("{}", err))?
-                                .is_file()
-                            {
-                                continue;
-                            }
+                                .map_err(|err| anyhow::anyhow!("{}", err))?;
+                            let modified = metadata
+                                .modified()
+                                .map_err(|err| anyhow::anyhow!("{}", err))?;
+                            let data = (metadata.len(), modified);
+                            map_entry.insert(data);
 
-                            let path = entry.path();
-                            if let hash_map::Entry::Vacant(map_entry) = current.entry(path.clone())
-                            {
-                                let metadata = entry
-                                    .metadata()
-                                    .await
-                                    .map_err(|err| anyhow::anyhow!("{}", err))?;
-                                let modified = metadata
-                                    .modified()
-                                    .map_err(|err| anyhow::anyhow!("{}", err))?;
-                                let data = (metadata.len(), modified);
-                                map_entry.insert(data);
+                            let updated = match old.get(&path) {
+                                Some(old_data) => old_data != &data,
+                                None => true,
+                            };
 
-                                let updated = match old.get(&path) {
-                                    Some(old_data) => old_data != &data,
-                                    None => true,
-                                };
-
-                                if updated || recheck {
-                                    tx.send(path).unwrap();
-                                    status.found.fetch_add(1, Ordering::SeqCst);
-                                    if let Some(cb) = cb.as_ref() {
-                                        cb.callback(status.resolve()).await?;
-                                    }
+                            if updated || recheck {
+                                tx.send(path).unwrap();
+                                status.found.fetch_add(1, Ordering::SeqCst);
+                                if let Some(cb) = cb.as_ref() {
+                                    cb.callback(status.resolve()).await?;
                                 }
                             }
                         }
                     }
-
-                    *doc_data.files.write() = Arc::new(current);
-
-                    self.write_sources()?;
-
-                    anyhow::Ok(())
-                };
-
-                if let Err(err) = fut().await {
-                    log::error!("{}", err);
                 }
-            });
-        });
 
+                *doc_data.files.write() = Arc::new(current);
+
+                self.write_sources()?;
+
+                anyhow::Ok(())
+            }
+        );
+
+        res_a?;
+        res_b?;
         Ok(())
     }
 }
