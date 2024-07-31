@@ -29,20 +29,23 @@ pub struct DocData {
 #[derive(uniffi::Record)]
 pub struct UpdateStatus {
     pub found: u64,
-    pub updated: u64,
+    pub completed: u64,
+    pub new: u64,
 }
 
 #[derive(Default)]
 struct UpdateStatusAtomic {
     pub found: AtomicU64,
-    pub updated: AtomicU64,
+    pub completed: AtomicU64,
+    pub new: AtomicU64,
 }
 
 impl UpdateStatusAtomic {
     fn resolve(&self) -> UpdateStatus {
         UpdateStatus {
             found: self.found.load(Ordering::SeqCst),
-            updated: self.updated.load(Ordering::SeqCst),
+            completed: self.completed.load(Ordering::SeqCst),
+            new: self.new.load(Ordering::SeqCst),
         }
     }
 }
@@ -160,7 +163,7 @@ impl Backend {
                         .map_err(|err| anyhow::anyhow!("{}", err))?;
 
                     while stream.next().await.is_some() {}
-                    status.updated.fetch_add(1, Ordering::SeqCst);
+                    status.completed.fetch_add(1, Ordering::SeqCst);
                     if let Some(cb) = cb.as_ref() {
                         cb.callback(status.resolve()).await?;
                     }
@@ -213,9 +216,11 @@ impl Backend {
                                 None => true,
                             };
 
+                            status.found.fetch_add(1, Ordering::SeqCst);
+
                             if updated || recheck {
                                 tx.send(path).unwrap();
-                                status.found.fetch_add(1, Ordering::SeqCst);
+                                status.new.fetch_add(1, Ordering::SeqCst);
                                 if let Some(cb) = cb.as_ref() {
                                     cb.callback(status.resolve()).await?;
                                 }
