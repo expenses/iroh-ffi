@@ -221,9 +221,10 @@ impl Backend {
                             if updated || recheck {
                                 tx.send(path).unwrap();
                                 status.new.fetch_add(1, Ordering::SeqCst);
-                                if let Some(cb) = cb.as_ref() {
-                                    cb.callback(status.resolve()).await?;
-                                }
+                            }
+
+                            if let Some(cb) = cb.as_ref() {
+                                cb.callback(status.resolve()).await?;
                             }
                         }
                     }
