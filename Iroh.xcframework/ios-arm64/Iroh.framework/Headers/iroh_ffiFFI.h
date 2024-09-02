@@ -257,6 +257,12 @@ typedef void (*UniffiCallbackInterfaceAddCallbackMethod0)(uint64_t, void*_Nonnul
     );
 
 #endif
+#ifndef UNIFFI_FFIDEF_CALLBACK_INTERFACE_BLOB_PROVIDE_EVENT_CALLBACK_METHOD0
+#define UNIFFI_FFIDEF_CALLBACK_INTERFACE_BLOB_PROVIDE_EVENT_CALLBACK_METHOD0
+typedef void (*UniffiCallbackInterfaceBlobProvideEventCallbackMethod0)(uint64_t, void*_Nonnull, UniffiForeignFutureCompleteVoid _Nonnull, uint64_t, UniffiForeignFuture* _Nonnull
+    );
+
+#endif
 #ifndef UNIFFI_FFIDEF_CALLBACK_INTERFACE_DOC_EXPORT_FILE_CALLBACK_METHOD0
 #define UNIFFI_FFIDEF_CALLBACK_INTERFACE_DOC_EXPORT_FILE_CALLBACK_METHOD0
 typedef void (*UniffiCallbackInterfaceDocExportFileCallbackMethod0)(uint64_t, void*_Nonnull, UniffiForeignFutureCompleteVoid _Nonnull, uint64_t, UniffiForeignFuture* _Nonnull
@@ -293,6 +299,14 @@ typedef struct UniffiVTableCallbackInterfaceAddCallback {
     UniffiCallbackInterfaceAddCallbackMethod0 _Nonnull progress;
     UniffiCallbackInterfaceFree _Nonnull uniffiFree;
 } UniffiVTableCallbackInterfaceAddCallback;
+
+#endif
+#ifndef UNIFFI_FFIDEF_V_TABLE_CALLBACK_INTERFACE_BLOB_PROVIDE_EVENT_CALLBACK
+#define UNIFFI_FFIDEF_V_TABLE_CALLBACK_INTERFACE_BLOB_PROVIDE_EVENT_CALLBACK
+typedef struct UniffiVTableCallbackInterfaceBlobProvideEventCallback {
+    UniffiCallbackInterfaceBlobProvideEventCallbackMethod0 _Nonnull blobEvent;
+    UniffiCallbackInterfaceFree _Nonnull uniffiFree;
+} UniffiVTableCallbackInterfaceBlobProvideEventCallback;
 
 #endif
 #ifndef UNIFFI_FFIDEF_V_TABLE_CALLBACK_INTERFACE_DOC_EXPORT_FILE_CALLBACK
@@ -502,7 +516,82 @@ void uniffi_iroh_ffi_fn_free_blobdownloadoptions(void*_Nonnull ptr, RustCallStat
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_CONSTRUCTOR_BLOBDOWNLOADOPTIONS_NEW
 #define UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_CONSTRUCTOR_BLOBDOWNLOADOPTIONS_NEW
-void*_Nonnull uniffi_iroh_ffi_fn_constructor_blobdownloadoptions_new(RustBuffer format, void*_Nonnull node, void*_Nonnull tag, RustCallStatus *_Nonnull out_status
+void*_Nonnull uniffi_iroh_ffi_fn_constructor_blobdownloadoptions_new(RustBuffer format, RustBuffer nodes, void*_Nonnull tag, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_CLONE_BLOBPROVIDEEVENT
+#define UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_CLONE_BLOBPROVIDEEVENT
+void*_Nonnull uniffi_iroh_ffi_fn_clone_blobprovideevent(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_FREE_BLOBPROVIDEEVENT
+#define UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_FREE_BLOBPROVIDEEVENT
+void uniffi_iroh_ffi_fn_free_blobprovideevent(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_METHOD_BLOBPROVIDEEVENT_AS_CLIENT_CONNECTED
+#define UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_METHOD_BLOBPROVIDEEVENT_AS_CLIENT_CONNECTED
+RustBuffer uniffi_iroh_ffi_fn_method_blobprovideevent_as_client_connected(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_METHOD_BLOBPROVIDEEVENT_AS_GET_REQUEST_RECEIVED
+#define UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_METHOD_BLOBPROVIDEEVENT_AS_GET_REQUEST_RECEIVED
+RustBuffer uniffi_iroh_ffi_fn_method_blobprovideevent_as_get_request_received(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_METHOD_BLOBPROVIDEEVENT_AS_TAGGED_BLOB_ADDED
+#define UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_METHOD_BLOBPROVIDEEVENT_AS_TAGGED_BLOB_ADDED
+RustBuffer uniffi_iroh_ffi_fn_method_blobprovideevent_as_tagged_blob_added(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_METHOD_BLOBPROVIDEEVENT_AS_TRANSFER_ABORTED
+#define UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_METHOD_BLOBPROVIDEEVENT_AS_TRANSFER_ABORTED
+RustBuffer uniffi_iroh_ffi_fn_method_blobprovideevent_as_transfer_aborted(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_METHOD_BLOBPROVIDEEVENT_AS_TRANSFER_BLOB_COMPLETED
+#define UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_METHOD_BLOBPROVIDEEVENT_AS_TRANSFER_BLOB_COMPLETED
+RustBuffer uniffi_iroh_ffi_fn_method_blobprovideevent_as_transfer_blob_completed(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_METHOD_BLOBPROVIDEEVENT_AS_TRANSFER_COMPLETED
+#define UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_METHOD_BLOBPROVIDEEVENT_AS_TRANSFER_COMPLETED
+RustBuffer uniffi_iroh_ffi_fn_method_blobprovideevent_as_transfer_completed(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_METHOD_BLOBPROVIDEEVENT_AS_TRANSFER_HASH_SEQ_STARTED
+#define UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_METHOD_BLOBPROVIDEEVENT_AS_TRANSFER_HASH_SEQ_STARTED
+RustBuffer uniffi_iroh_ffi_fn_method_blobprovideevent_as_transfer_hash_seq_started(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_METHOD_BLOBPROVIDEEVENT_AS_TRANSFER_PROGRESS
+#define UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_METHOD_BLOBPROVIDEEVENT_AS_TRANSFER_PROGRESS
+RustBuffer uniffi_iroh_ffi_fn_method_blobprovideevent_as_transfer_progress(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_METHOD_BLOBPROVIDEEVENT_TYPE
+#define UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_METHOD_BLOBPROVIDEEVENT_TYPE
+RustBuffer uniffi_iroh_ffi_fn_method_blobprovideevent_type(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_CLONE_BLOBPROVIDEEVENTCALLBACK
+#define UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_CLONE_BLOBPROVIDEEVENTCALLBACK
+void*_Nonnull uniffi_iroh_ffi_fn_clone_blobprovideeventcallback(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_FREE_BLOBPROVIDEEVENTCALLBACK
+#define UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_FREE_BLOBPROVIDEEVENTCALLBACK
+void uniffi_iroh_ffi_fn_free_blobprovideeventcallback(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_INIT_CALLBACK_VTABLE_BLOBPROVIDEEVENTCALLBACK
+#define UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_INIT_CALLBACK_VTABLE_BLOBPROVIDEEVENTCALLBACK
+void uniffi_iroh_ffi_fn_init_callback_vtable_blobprovideeventcallback(UniffiVTableCallbackInterfaceBlobProvideEventCallback* _Nonnull vtable
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_METHOD_BLOBPROVIDEEVENTCALLBACK_BLOB_EVENT
+#define UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_METHOD_BLOBPROVIDEEVENTCALLBACK_BLOB_EVENT
+uint64_t uniffi_iroh_ffi_fn_method_blobprovideeventcallback_blob_event(void*_Nonnull ptr, void*_Nonnull event
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_CLONE_BLOBTICKET
@@ -543,6 +632,11 @@ void*_Nonnull uniffi_iroh_ffi_fn_method_blobticket_node_addr(void*_Nonnull ptr, 
 #ifndef UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_METHOD_BLOBTICKET_RECURSIVE
 #define UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_METHOD_BLOBTICKET_RECURSIVE
 int8_t uniffi_iroh_ffi_fn_method_blobticket_recursive(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_METHOD_BLOBTICKET_UNIFFI_TRAIT_DISPLAY
+#define UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_METHOD_BLOBTICKET_UNIFFI_TRAIT_DISPLAY
+RustBuffer uniffi_iroh_ffi_fn_method_blobticket_uniffi_trait_display(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_CLONE_BLOBS
@@ -756,9 +850,9 @@ void uniffi_iroh_ffi_fn_free_doc(void*_Nonnull ptr, RustCallStatus *_Nonnull out
 uint64_t uniffi_iroh_ffi_fn_method_doc_close_me(void*_Nonnull ptr
 );
 #endif
-#ifndef UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_METHOD_DOC_DELETE_ENTRY
-#define UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_METHOD_DOC_DELETE_ENTRY
-uint64_t uniffi_iroh_ffi_fn_method_doc_delete_entry(void*_Nonnull ptr, void*_Nonnull author_id, RustBuffer prefix
+#ifndef UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_METHOD_DOC_DELETE
+#define UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_METHOD_DOC_DELETE
+uint64_t uniffi_iroh_ffi_fn_method_doc_delete(void*_Nonnull ptr, void*_Nonnull author_id, RustBuffer prefix
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_METHOD_DOC_EXPORT_FILE
@@ -951,6 +1045,26 @@ RustBuffer uniffi_iroh_ffi_fn_method_docimportprogress_as_progress(void*_Nonnull
 RustBuffer uniffi_iroh_ffi_fn_method_docimportprogress_type(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_CLONE_DOCTICKET
+#define UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_CLONE_DOCTICKET
+void*_Nonnull uniffi_iroh_ffi_fn_clone_docticket(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_FREE_DOCTICKET
+#define UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_FREE_DOCTICKET
+void uniffi_iroh_ffi_fn_free_docticket(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_CONSTRUCTOR_DOCTICKET_NEW
+#define UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_CONSTRUCTOR_DOCTICKET_NEW
+void*_Nonnull uniffi_iroh_ffi_fn_constructor_docticket_new(RustBuffer str, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_METHOD_DOCTICKET_UNIFFI_TRAIT_DISPLAY
+#define UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_METHOD_DOCTICKET_UNIFFI_TRAIT_DISPLAY
+RustBuffer uniffi_iroh_ffi_fn_method_docticket_uniffi_trait_display(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_CLONE_DOCS
 #define UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_CLONE_DOCS
 void*_Nonnull uniffi_iroh_ffi_fn_clone_docs(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
@@ -973,12 +1087,12 @@ uint64_t uniffi_iroh_ffi_fn_method_docs_drop_doc(void*_Nonnull ptr, RustBuffer d
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_METHOD_DOCS_JOIN
 #define UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_METHOD_DOCS_JOIN
-uint64_t uniffi_iroh_ffi_fn_method_docs_join(void*_Nonnull ptr, RustBuffer ticket
+uint64_t uniffi_iroh_ffi_fn_method_docs_join(void*_Nonnull ptr, void*_Nonnull ticket
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_METHOD_DOCS_JOIN_AND_SUBSCRIBE
 #define UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_METHOD_DOCS_JOIN_AND_SUBSCRIBE
-uint64_t uniffi_iroh_ffi_fn_method_docs_join_and_subscribe(void*_Nonnull ptr, RustBuffer ticket, void*_Nonnull cb
+uint64_t uniffi_iroh_ffi_fn_method_docs_join_and_subscribe(void*_Nonnull ptr, void*_Nonnull ticket, void*_Nonnull cb
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_METHOD_DOCS_LIST
@@ -1294,6 +1408,11 @@ void*_Nonnull uniffi_iroh_ffi_fn_method_iroh_docs(void*_Nonnull ptr, RustCallSta
 void*_Nonnull uniffi_iroh_ffi_fn_method_iroh_gossip(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_METHOD_IROH_NET
+#define UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_METHOD_IROH_NET
+void*_Nonnull uniffi_iroh_ffi_fn_method_iroh_net(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_METHOD_IROH_NODE
 #define UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_METHOD_IROH_NODE
 void*_Nonnull uniffi_iroh_ffi_fn_method_iroh_node(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
@@ -1384,6 +1503,11 @@ void uniffi_iroh_ffi_fn_free_message(void*_Nonnull ptr, RustCallStatus *_Nonnull
 RustBuffer uniffi_iroh_ffi_fn_method_message_as_error(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_METHOD_MESSAGE_AS_JOINED
+#define UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_METHOD_MESSAGE_AS_JOINED
+RustBuffer uniffi_iroh_ffi_fn_method_message_as_joined(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_METHOD_MESSAGE_AS_NEIGHBOR_DOWN
 #define UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_METHOD_MESSAGE_AS_NEIGHBOR_DOWN
 RustBuffer uniffi_iroh_ffi_fn_method_message_as_neighbor_down(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
@@ -1404,6 +1528,46 @@ RustBuffer uniffi_iroh_ffi_fn_method_message_as_received(void*_Nonnull ptr, Rust
 RustBuffer uniffi_iroh_ffi_fn_method_message_type(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_CLONE_NET
+#define UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_CLONE_NET
+void*_Nonnull uniffi_iroh_ffi_fn_clone_net(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_FREE_NET
+#define UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_FREE_NET
+void uniffi_iroh_ffi_fn_free_net(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_METHOD_NET_ADD_NODE_ADDR
+#define UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_METHOD_NET_ADD_NODE_ADDR
+uint64_t uniffi_iroh_ffi_fn_method_net_add_node_addr(void*_Nonnull ptr, void*_Nonnull addr
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_METHOD_NET_HOME_RELAY
+#define UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_METHOD_NET_HOME_RELAY
+uint64_t uniffi_iroh_ffi_fn_method_net_home_relay(void*_Nonnull ptr
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_METHOD_NET_NODE_ADDR
+#define UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_METHOD_NET_NODE_ADDR
+uint64_t uniffi_iroh_ffi_fn_method_net_node_addr(void*_Nonnull ptr
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_METHOD_NET_NODE_ID
+#define UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_METHOD_NET_NODE_ID
+uint64_t uniffi_iroh_ffi_fn_method_net_node_id(void*_Nonnull ptr
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_METHOD_NET_REMOTE_INFO
+#define UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_METHOD_NET_REMOTE_INFO
+uint64_t uniffi_iroh_ffi_fn_method_net_remote_info(void*_Nonnull ptr, void*_Nonnull node_id
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_METHOD_NET_REMOTE_INFO_LIST
+#define UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_METHOD_NET_REMOTE_INFO_LIST
+uint64_t uniffi_iroh_ffi_fn_method_net_remote_info_list(void*_Nonnull ptr
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_CLONE_NODE
 #define UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_CLONE_NODE
 void*_Nonnull uniffi_iroh_ffi_fn_clone_node(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
@@ -1414,39 +1578,9 @@ void*_Nonnull uniffi_iroh_ffi_fn_clone_node(void*_Nonnull ptr, RustCallStatus *_
 void uniffi_iroh_ffi_fn_free_node(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
 );
 #endif
-#ifndef UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_METHOD_NODE_ADD_NODE_ADDR
-#define UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_METHOD_NODE_ADD_NODE_ADDR
-uint64_t uniffi_iroh_ffi_fn_method_node_add_node_addr(void*_Nonnull ptr, void*_Nonnull addr
-);
-#endif
-#ifndef UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_METHOD_NODE_CONNECTION_INFO
-#define UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_METHOD_NODE_CONNECTION_INFO
-uint64_t uniffi_iroh_ffi_fn_method_node_connection_info(void*_Nonnull ptr, void*_Nonnull node_id
-);
-#endif
-#ifndef UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_METHOD_NODE_CONNECTIONS
-#define UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_METHOD_NODE_CONNECTIONS
-uint64_t uniffi_iroh_ffi_fn_method_node_connections(void*_Nonnull ptr
-);
-#endif
-#ifndef UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_METHOD_NODE_HOME_RELAY
-#define UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_METHOD_NODE_HOME_RELAY
-uint64_t uniffi_iroh_ffi_fn_method_node_home_relay(void*_Nonnull ptr
-);
-#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_METHOD_NODE_MY_RPC_ADDR
 #define UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_METHOD_NODE_MY_RPC_ADDR
 RustBuffer uniffi_iroh_ffi_fn_method_node_my_rpc_addr(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
-);
-#endif
-#ifndef UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_METHOD_NODE_NODE_ADDR
-#define UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_METHOD_NODE_NODE_ADDR
-uint64_t uniffi_iroh_ffi_fn_method_node_node_addr(void*_Nonnull ptr
-);
-#endif
-#ifndef UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_METHOD_NODE_NODE_ID
-#define UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_METHOD_NODE_NODE_ID
-uint64_t uniffi_iroh_ffi_fn_method_node_node_id(void*_Nonnull ptr
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_IROH_FFI_FN_METHOD_NODE_SHUTDOWN
@@ -2172,6 +2306,66 @@ uint16_t uniffi_iroh_ffi_checksum_method_authors_list(void
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_IROH_FFI_CHECKSUM_METHOD_BLOBPROVIDEEVENT_AS_CLIENT_CONNECTED
+#define UNIFFI_FFIDEF_UNIFFI_IROH_FFI_CHECKSUM_METHOD_BLOBPROVIDEEVENT_AS_CLIENT_CONNECTED
+uint16_t uniffi_iroh_ffi_checksum_method_blobprovideevent_as_client_connected(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_IROH_FFI_CHECKSUM_METHOD_BLOBPROVIDEEVENT_AS_GET_REQUEST_RECEIVED
+#define UNIFFI_FFIDEF_UNIFFI_IROH_FFI_CHECKSUM_METHOD_BLOBPROVIDEEVENT_AS_GET_REQUEST_RECEIVED
+uint16_t uniffi_iroh_ffi_checksum_method_blobprovideevent_as_get_request_received(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_IROH_FFI_CHECKSUM_METHOD_BLOBPROVIDEEVENT_AS_TAGGED_BLOB_ADDED
+#define UNIFFI_FFIDEF_UNIFFI_IROH_FFI_CHECKSUM_METHOD_BLOBPROVIDEEVENT_AS_TAGGED_BLOB_ADDED
+uint16_t uniffi_iroh_ffi_checksum_method_blobprovideevent_as_tagged_blob_added(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_IROH_FFI_CHECKSUM_METHOD_BLOBPROVIDEEVENT_AS_TRANSFER_ABORTED
+#define UNIFFI_FFIDEF_UNIFFI_IROH_FFI_CHECKSUM_METHOD_BLOBPROVIDEEVENT_AS_TRANSFER_ABORTED
+uint16_t uniffi_iroh_ffi_checksum_method_blobprovideevent_as_transfer_aborted(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_IROH_FFI_CHECKSUM_METHOD_BLOBPROVIDEEVENT_AS_TRANSFER_BLOB_COMPLETED
+#define UNIFFI_FFIDEF_UNIFFI_IROH_FFI_CHECKSUM_METHOD_BLOBPROVIDEEVENT_AS_TRANSFER_BLOB_COMPLETED
+uint16_t uniffi_iroh_ffi_checksum_method_blobprovideevent_as_transfer_blob_completed(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_IROH_FFI_CHECKSUM_METHOD_BLOBPROVIDEEVENT_AS_TRANSFER_COMPLETED
+#define UNIFFI_FFIDEF_UNIFFI_IROH_FFI_CHECKSUM_METHOD_BLOBPROVIDEEVENT_AS_TRANSFER_COMPLETED
+uint16_t uniffi_iroh_ffi_checksum_method_blobprovideevent_as_transfer_completed(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_IROH_FFI_CHECKSUM_METHOD_BLOBPROVIDEEVENT_AS_TRANSFER_HASH_SEQ_STARTED
+#define UNIFFI_FFIDEF_UNIFFI_IROH_FFI_CHECKSUM_METHOD_BLOBPROVIDEEVENT_AS_TRANSFER_HASH_SEQ_STARTED
+uint16_t uniffi_iroh_ffi_checksum_method_blobprovideevent_as_transfer_hash_seq_started(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_IROH_FFI_CHECKSUM_METHOD_BLOBPROVIDEEVENT_AS_TRANSFER_PROGRESS
+#define UNIFFI_FFIDEF_UNIFFI_IROH_FFI_CHECKSUM_METHOD_BLOBPROVIDEEVENT_AS_TRANSFER_PROGRESS
+uint16_t uniffi_iroh_ffi_checksum_method_blobprovideevent_as_transfer_progress(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_IROH_FFI_CHECKSUM_METHOD_BLOBPROVIDEEVENT_TYPE
+#define UNIFFI_FFIDEF_UNIFFI_IROH_FFI_CHECKSUM_METHOD_BLOBPROVIDEEVENT_TYPE
+uint16_t uniffi_iroh_ffi_checksum_method_blobprovideevent_type(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_IROH_FFI_CHECKSUM_METHOD_BLOBPROVIDEEVENTCALLBACK_BLOB_EVENT
+#define UNIFFI_FFIDEF_UNIFFI_IROH_FFI_CHECKSUM_METHOD_BLOBPROVIDEEVENTCALLBACK_BLOB_EVENT
+uint16_t uniffi_iroh_ffi_checksum_method_blobprovideeventcallback_blob_event(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_IROH_FFI_CHECKSUM_METHOD_BLOBTICKET_AS_DOWNLOAD_OPTIONS
 #define UNIFFI_FFIDEF_UNIFFI_IROH_FFI_CHECKSUM_METHOD_BLOBTICKET_AS_DOWNLOAD_OPTIONS
 uint16_t uniffi_iroh_ffi_checksum_method_blobticket_as_download_options(void
@@ -2388,9 +2582,9 @@ uint16_t uniffi_iroh_ffi_checksum_method_doc_close_me(void
     
 );
 #endif
-#ifndef UNIFFI_FFIDEF_UNIFFI_IROH_FFI_CHECKSUM_METHOD_DOC_DELETE_ENTRY
-#define UNIFFI_FFIDEF_UNIFFI_IROH_FFI_CHECKSUM_METHOD_DOC_DELETE_ENTRY
-uint16_t uniffi_iroh_ffi_checksum_method_doc_delete_entry(void
+#ifndef UNIFFI_FFIDEF_UNIFFI_IROH_FFI_CHECKSUM_METHOD_DOC_DELETE
+#define UNIFFI_FFIDEF_UNIFFI_IROH_FFI_CHECKSUM_METHOD_DOC_DELETE
+uint16_t uniffi_iroh_ffi_checksum_method_doc_delete(void
     
 );
 #endif
@@ -2754,6 +2948,12 @@ uint16_t uniffi_iroh_ffi_checksum_method_iroh_gossip(void
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_IROH_FFI_CHECKSUM_METHOD_IROH_NET
+#define UNIFFI_FFIDEF_UNIFFI_IROH_FFI_CHECKSUM_METHOD_IROH_NET
+uint16_t uniffi_iroh_ffi_checksum_method_iroh_net(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_IROH_FFI_CHECKSUM_METHOD_IROH_NODE
 #define UNIFFI_FFIDEF_UNIFFI_IROH_FFI_CHECKSUM_METHOD_IROH_NODE
 uint16_t uniffi_iroh_ffi_checksum_method_iroh_node(void
@@ -2820,6 +3020,12 @@ uint16_t uniffi_iroh_ffi_checksum_method_message_as_error(void
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_IROH_FFI_CHECKSUM_METHOD_MESSAGE_AS_JOINED
+#define UNIFFI_FFIDEF_UNIFFI_IROH_FFI_CHECKSUM_METHOD_MESSAGE_AS_JOINED
+uint16_t uniffi_iroh_ffi_checksum_method_message_as_joined(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_IROH_FFI_CHECKSUM_METHOD_MESSAGE_AS_NEIGHBOR_DOWN
 #define UNIFFI_FFIDEF_UNIFFI_IROH_FFI_CHECKSUM_METHOD_MESSAGE_AS_NEIGHBOR_DOWN
 uint16_t uniffi_iroh_ffi_checksum_method_message_as_neighbor_down(void
@@ -2844,45 +3050,45 @@ uint16_t uniffi_iroh_ffi_checksum_method_message_type(void
     
 );
 #endif
-#ifndef UNIFFI_FFIDEF_UNIFFI_IROH_FFI_CHECKSUM_METHOD_NODE_ADD_NODE_ADDR
-#define UNIFFI_FFIDEF_UNIFFI_IROH_FFI_CHECKSUM_METHOD_NODE_ADD_NODE_ADDR
-uint16_t uniffi_iroh_ffi_checksum_method_node_add_node_addr(void
+#ifndef UNIFFI_FFIDEF_UNIFFI_IROH_FFI_CHECKSUM_METHOD_NET_ADD_NODE_ADDR
+#define UNIFFI_FFIDEF_UNIFFI_IROH_FFI_CHECKSUM_METHOD_NET_ADD_NODE_ADDR
+uint16_t uniffi_iroh_ffi_checksum_method_net_add_node_addr(void
     
 );
 #endif
-#ifndef UNIFFI_FFIDEF_UNIFFI_IROH_FFI_CHECKSUM_METHOD_NODE_CONNECTION_INFO
-#define UNIFFI_FFIDEF_UNIFFI_IROH_FFI_CHECKSUM_METHOD_NODE_CONNECTION_INFO
-uint16_t uniffi_iroh_ffi_checksum_method_node_connection_info(void
+#ifndef UNIFFI_FFIDEF_UNIFFI_IROH_FFI_CHECKSUM_METHOD_NET_HOME_RELAY
+#define UNIFFI_FFIDEF_UNIFFI_IROH_FFI_CHECKSUM_METHOD_NET_HOME_RELAY
+uint16_t uniffi_iroh_ffi_checksum_method_net_home_relay(void
     
 );
 #endif
-#ifndef UNIFFI_FFIDEF_UNIFFI_IROH_FFI_CHECKSUM_METHOD_NODE_CONNECTIONS
-#define UNIFFI_FFIDEF_UNIFFI_IROH_FFI_CHECKSUM_METHOD_NODE_CONNECTIONS
-uint16_t uniffi_iroh_ffi_checksum_method_node_connections(void
+#ifndef UNIFFI_FFIDEF_UNIFFI_IROH_FFI_CHECKSUM_METHOD_NET_NODE_ADDR
+#define UNIFFI_FFIDEF_UNIFFI_IROH_FFI_CHECKSUM_METHOD_NET_NODE_ADDR
+uint16_t uniffi_iroh_ffi_checksum_method_net_node_addr(void
     
 );
 #endif
-#ifndef UNIFFI_FFIDEF_UNIFFI_IROH_FFI_CHECKSUM_METHOD_NODE_HOME_RELAY
-#define UNIFFI_FFIDEF_UNIFFI_IROH_FFI_CHECKSUM_METHOD_NODE_HOME_RELAY
-uint16_t uniffi_iroh_ffi_checksum_method_node_home_relay(void
+#ifndef UNIFFI_FFIDEF_UNIFFI_IROH_FFI_CHECKSUM_METHOD_NET_NODE_ID
+#define UNIFFI_FFIDEF_UNIFFI_IROH_FFI_CHECKSUM_METHOD_NET_NODE_ID
+uint16_t uniffi_iroh_ffi_checksum_method_net_node_id(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_IROH_FFI_CHECKSUM_METHOD_NET_REMOTE_INFO
+#define UNIFFI_FFIDEF_UNIFFI_IROH_FFI_CHECKSUM_METHOD_NET_REMOTE_INFO
+uint16_t uniffi_iroh_ffi_checksum_method_net_remote_info(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_IROH_FFI_CHECKSUM_METHOD_NET_REMOTE_INFO_LIST
+#define UNIFFI_FFIDEF_UNIFFI_IROH_FFI_CHECKSUM_METHOD_NET_REMOTE_INFO_LIST
+uint16_t uniffi_iroh_ffi_checksum_method_net_remote_info_list(void
     
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_IROH_FFI_CHECKSUM_METHOD_NODE_MY_RPC_ADDR
 #define UNIFFI_FFIDEF_UNIFFI_IROH_FFI_CHECKSUM_METHOD_NODE_MY_RPC_ADDR
 uint16_t uniffi_iroh_ffi_checksum_method_node_my_rpc_addr(void
-    
-);
-#endif
-#ifndef UNIFFI_FFIDEF_UNIFFI_IROH_FFI_CHECKSUM_METHOD_NODE_NODE_ADDR
-#define UNIFFI_FFIDEF_UNIFFI_IROH_FFI_CHECKSUM_METHOD_NODE_NODE_ADDR
-uint16_t uniffi_iroh_ffi_checksum_method_node_node_addr(void
-    
-);
-#endif
-#ifndef UNIFFI_FFIDEF_UNIFFI_IROH_FFI_CHECKSUM_METHOD_NODE_NODE_ID
-#define UNIFFI_FFIDEF_UNIFFI_IROH_FFI_CHECKSUM_METHOD_NODE_NODE_ID
-uint16_t uniffi_iroh_ffi_checksum_method_node_node_id(void
     
 );
 #endif
@@ -3045,6 +3251,12 @@ uint16_t uniffi_iroh_ffi_checksum_constructor_blobticket_new(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_IROH_FFI_CHECKSUM_CONSTRUCTOR_COLLECTION_NEW
 #define UNIFFI_FFIDEF_UNIFFI_IROH_FFI_CHECKSUM_CONSTRUCTOR_COLLECTION_NEW
 uint16_t uniffi_iroh_ffi_checksum_constructor_collection_new(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_IROH_FFI_CHECKSUM_CONSTRUCTOR_DOCTICKET_NEW
+#define UNIFFI_FFIDEF_UNIFFI_IROH_FFI_CHECKSUM_CONSTRUCTOR_DOCTICKET_NEW
+uint16_t uniffi_iroh_ffi_checksum_constructor_docticket_new(void
     
 );
 #endif
