@@ -4,20 +4,23 @@ import pytest
 import asyncio
 import iroh
 
-from iroh import Iroh, ShareMode, LiveEventType, AddrInfoOptions, NodeOptions
+from iroh import Iroh, ShareMode, LiveEventType, AddrInfoOptions, NodeOptions, NodeOptions, NodeAddr, PublicKey
 
 @pytest.mark.asyncio
 async def test_basic_sync():
     # setup event loop, to ensure async callbacks work
     iroh.iroh_ffi.uniffi_set_event_loop(asyncio.get_running_loop())
 
+    options = NodeOptions()
+    options.enable_docs = True
+
     # Create node_0
     iroh_dir_0 = tempfile.TemporaryDirectory()
-    node_0 = await Iroh.persistent(iroh_dir_0.name)
+    node_0 = await Iroh.persistent_with_options(iroh_dir_0.name, options)
 
     # Create node_1
     iroh_dir_1 = tempfile.TemporaryDirectory()
-    node_1 = await Iroh.persistent(iroh_dir_1.name)
+    node_1 = await Iroh.persistent_with_options(iroh_dir_1.name, options)
 
     # Create doc on node_0
     doc_0 = await node_0.docs().create()
@@ -104,7 +107,9 @@ async def test_custom_protocol():
     node_id = await node_1.net().node_id()
 
     endpoint = node_2.node().endpoint()
-    conn = await endpoint.connect_by_node_id(node_id, alpn)
+
+    node_addr = NodeAddr(PublicKey.from_string(node_id), None, [])
+    conn = await endpoint.connect(node_addr, alpn)
     remote = conn.get_remote_node_id()
     print("", remote)
 
